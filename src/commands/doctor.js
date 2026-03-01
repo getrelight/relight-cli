@@ -4,10 +4,14 @@ import {
   tryGetConfig,
   CONFIG_PATH,
   CLOUD_NAMES,
+  SERVICE_TYPES,
+  getRegisteredServices,
+  normalizeServiceConfig,
 } from "../lib/config.js";
 import { verifyToken as cfVerify, getWorkersSubdomain } from "../lib/clouds/cf.js";
 import { mintAccessToken, verifyProject as gcpVerifyProject, listRegions as gcpListRegions, gcpApi, AR_API, SQLADMIN_API, DNS_API } from "../lib/clouds/gcp.js";
 import { verifyCredentials as awsVerify, checkAppRunner, awsJsonApi, awsQueryApi, awsRestXmlApi } from "../lib/clouds/aws.js";
+import { verifyConnection as slicerVerify } from "../lib/clouds/slicervm.js";
 import kleur from "kleur";
 
 var PASS = kleur.green("[ok]");
@@ -16,7 +20,7 @@ var SKIP = kleur.yellow("[--]");
 
 export async function doctor() {
   process.stderr.write(`\n${kleur.bold("relight doctor")}\n`);
-  process.stderr.write(`${kleur.dim("─".repeat(50))}\n\n`);
+  process.stderr.write(`${kleur.dim("-".repeat(50))}\n\n`);
   var allGood = true;
 
   // --- General checks ---
@@ -73,9 +77,29 @@ export async function doctor() {
     }
   }
 
+  // --- Services ---
+
+  var services = getRegisteredServices();
+  if (services.length > 0) {
+    process.stderr.write(`\n${kleur.bold("  Services")}\n`);
+
+    for (var service of services) {
+      var typeName = SERVICE_TYPES[service.type]?.name || service.type;
+      var endpoint = service.socketPath || service.apiUrl || "unknown";
+
+      allGood =
+        (await asyncCheck(`${service.name} (${typeName} - ${endpoint})`, async () => {
+          if (service.type === "slicervm") {
+            var cfg = normalizeServiceConfig(service);
+            await slicerVerify(cfg);
+          }
+        })) && allGood;
+    }
+  }
+
   // --- Summary ---
 
-  process.stderr.write(`\n${kleur.dim("─".repeat(50))}\n`);
+  process.stderr.write(`\n${kleur.dim("-".repeat(50))}\n`);
   if (allGood) {
     process.stderr.write(kleur.green("All checks passed.\n\n"));
   } else {
@@ -204,7 +228,7 @@ function check(label, fn) {
     return true;
   } catch (e) {
     process.stderr.write(`  ${FAIL}  ${label}`);
-    if (e.message) process.stderr.write(kleur.dim(` — ${e.message}`));
+    if (e.message) process.stderr.write(kleur.dim(` - ${e.message}`));
     process.stderr.write("\n");
     return false;
   }
@@ -217,7 +241,7 @@ async function asyncCheck(label, fn) {
     return true;
   } catch (e) {
     process.stderr.write(`  ${FAIL}  ${label}`);
-    if (e.message) process.stderr.write(kleur.dim(` — ${truncate(e.message, 80)}`));
+    if (e.message) process.stderr.write(kleur.dim(` - ${truncate(e.message, 80)}`));
     process.stderr.write("\n");
     return false;
   }

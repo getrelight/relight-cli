@@ -1,13 +1,12 @@
 import { createInterface } from "readline";
-import { randomBytes } from "crypto";
 import { phase, status, success, hint, fatal, fmt, generateAppName } from "../lib/output.js";
 import { readLink, linkApp, resolveAppName } from "../lib/link.js";
-import { resolveCloudId, getCloudCfg, getProvider } from "../lib/providers/resolve.js";
+import { resolveTarget } from "../lib/providers/resolve.js";
 import { dockerBuild, dockerTag, dockerPush, dockerLogin } from "../lib/docker.js";
 
 export async function deploy(nameOrPath, path, options) {
-  var cloud = resolveCloudId(options.cloud);
-  var cfg = getCloudCfg(cloud);
+  var target = await resolveTarget(options);
+  var cfg = target.cfg;
 
   // Smart arg parsing: if first arg looks like a path, shift args
   var name;
@@ -26,12 +25,12 @@ export async function deploy(nameOrPath, path, options) {
   var tag = options.tag || `${Date.now()}`;
 
   // Get registry credentials and image tag
-  var registry = await getProvider(cloud, "registry");
+  var registry = await target.provider("registry");
   var remoteTag = await registry.getImageTag(cfg, name, tag);
   var localTag = `relight-${name}:${tag}`;
 
   // Load existing config from deployed worker (null on first deploy)
-  var appProvider = await getProvider(cloud, "app");
+  var appProvider = await target.provider("app");
   var appConfig;
   try {
     appConfig = await appProvider.getAppConfig(cfg, name);
@@ -41,7 +40,7 @@ export async function deploy(nameOrPath, path, options) {
 
   var isFirstDeploy = !appConfig;
 
-  // Get valid regions for this cloud
+  // Get valid regions for this cloud/service
   var validRegions = appProvider.getRegions();
   var validCodes = validRegions.map((r) => r.code);
 
@@ -89,12 +88,13 @@ export async function deploy(nameOrPath, path, options) {
       }
     }
 
-    var defaultRegion = cloud === "gcp" ? "us-central1" : cloud === "aws" ? "us-east-1" : cloud === "slicervm" ? "self-hosted" : "enam";
+    var isService = target.kind === "service";
+    var defaultRegion = isService ? "self-hosted" : target.type === "gcp" ? "us-central1" : target.type === "aws" ? "us-east-1" : "enam";
     var regions;
 
     if (options.regions) {
       regions = options.regions.split(",").map((r) => r.trim());
-    } else if ((cloud === "gcp" || cloud === "aws") && process.stdin.isTTY) {
+    } else if (!isService && (target.type === "gcp" || target.type === "aws") && process.stdin.isTTY) {
       // Interactive region picker for GCP/AWS first deploy
       var { createInterface: createRL } = await import("readline");
       var rl = createRL({ input: process.stdin, output: process.stderr });
@@ -130,10 +130,10 @@ export async function deploy(nameOrPath, path, options) {
     appConfig = {
       name,
       regions,
-      instances: options.instances || (cloud === "slicervm" ? 1 : 2),
+      instances: options.instances || (isService ? 1 : 2),
       port: options.port || 8080,
       sleepAfter: options.sleep || "30s",
-      instanceType: options.instanceType || (cloud === "gcp" || cloud === "aws" || cloud === "slicervm" ? undefined : "lite"),
+      instanceType: options.instanceType || (isService || target.type === "gcp" || target.type === "aws" ? undefined : "lite"),
       vcpu: options.vcpu || undefined,
       memory: options.memory || undefined,
       disk: options.disk || undefined,
@@ -147,48 +147,7 @@ export async function deploy(nameOrPath, path, options) {
     };
   }
 
-  // --- D1 database (--db flag, CF only) ---
   var newSecrets = {};
-  if (options.db && !appConfig.dbId) {
-    if (cloud === "gcp") {
-      process.stderr.write(
-        `\n${fmt.dim("Cloud SQL provisioning takes 3-10 minutes. Use 'relight db create' separately after deploy.")}\n\n`
-      );
-    } else if (cloud === "aws") {
-      process.stderr.write(
-        `\n${fmt.dim("RDS provisioning takes 5-15 minutes. Use 'relight db create' separately after deploy.")}\n\n`
-      );
-    } else if (cloud === "cf") {
-      var { createD1Database, getWorkersSubdomain } = await import("../lib/clouds/cf.js");
-      var dbResult = await createD1Database(cfg.accountId, cfg.apiToken, `relight-${name}`, {
-        locationHint: options.dbLocation,
-        jurisdiction: options.dbJurisdiction,
-      });
-      appConfig.dbId = dbResult.uuid;
-      appConfig.dbName = `relight-${name}`;
-
-      if (!appConfig.envKeys) appConfig.envKeys = [];
-      if (!appConfig.secretKeys) appConfig.secretKeys = [];
-      if (!appConfig.env) appConfig.env = {};
-
-      var subdomain = await getWorkersSubdomain(cfg.accountId, cfg.apiToken);
-      var dbUrl = subdomain
-        ? `https://relight-${name}.${subdomain}.workers.dev`
-        : null;
-
-      if (dbUrl) {
-        appConfig.env["DB_URL"] = dbUrl;
-        if (!appConfig.envKeys.includes("DB_URL")) appConfig.envKeys.push("DB_URL");
-      }
-
-      appConfig.env["DB_TOKEN"] = "[hidden]";
-      appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
-      appConfig.secretKeys.push("DB_TOKEN");
-      appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
-
-      newSecrets.DB_TOKEN = randomBytes(32).toString("hex");
-    }
-  }
 
   // --- Summary & confirmation ---
   var instanceDesc = appConfig.vcpu
@@ -198,7 +157,11 @@ export async function deploy(nameOrPath, path, options) {
   process.stderr.write(`\n${fmt.bold("Deploy summary")}\n`);
   process.stderr.write(`${fmt.dim("-".repeat(40))}\n`);
   process.stderr.write(`  ${fmt.bold("App:")}        ${fmt.app(name)}${isFirstDeploy ? fmt.dim(" (new)") : ""}\n`);
-  process.stderr.write(`  ${fmt.bold("Cloud:")}      ${fmt.cloud(cloud)}\n`);
+  if (target.kind === "service") {
+    process.stderr.write(`  ${fmt.bold("Service:")}    ${fmt.cloud(target.id)} ${fmt.dim(`(${target.type})`)}\n`);
+  } else {
+    process.stderr.write(`  ${fmt.bold("Cloud:")}      ${fmt.cloud(target.id)}\n`);
+  }
   process.stderr.write(`  ${fmt.bold("Path:")}       ${dockerPath}\n`);
   process.stderr.write(`  ${fmt.bold("Image:")}      ${remoteTag}\n`);
   process.stderr.write(`  ${fmt.bold("Regions:")}    ${appConfig.regions.join(", ")}\n`);
@@ -225,7 +188,7 @@ export async function deploy(nameOrPath, path, options) {
 
   // 1. Build Docker image
   var platform = "linux/amd64";
-  if (cloud === "slicervm") {
+  if (target.type === "slicervm") {
     // Match VM architecture
     var { listNodes } = await import("../lib/clouds/slicervm.js");
     var nodes = await listNodes(cfg);
@@ -236,8 +199,8 @@ export async function deploy(nameOrPath, path, options) {
   status(`${localTag} for ${platform}`);
   dockerBuild(dockerPath, localTag, { platform });
 
-  if (cloud === "slicervm") {
-    // SlicerVM: skip registry push - deploy extracts and uploads the image directly
+  if (target.kind === "service") {
+    // Service: skip registry push - deploy extracts and uploads the image directly
     phase("Deploying");
     await appProvider.deploy(cfg, name, localTag, {
       appConfig,
@@ -268,21 +231,20 @@ export async function deploy(nameOrPath, path, options) {
   var url = await appProvider.getAppUrl(cfg, name);
 
   if (options.json) {
-    console.log(
-      JSON.stringify(
-        {
-          name,
-          cloud,
-          image: remoteTag,
-          url,
-          regions: appConfig.regions,
-          instances: appConfig.instances,
-          firstDeploy: isFirstDeploy,
-        },
-        null,
-        2
-      )
-    );
+    var result = {
+      name,
+      image: remoteTag,
+      url,
+      regions: appConfig.regions,
+      instances: appConfig.instances,
+      firstDeploy: isFirstDeploy,
+    };
+    if (target.kind === "service") {
+      result.service = target.id;
+    } else {
+      result.cloud = target.id;
+    }
+    console.log(JSON.stringify(result, null, 2));
   } else {
     success(`App ${fmt.app(name)} deployed!`);
     process.stderr.write(`  ${fmt.bold("Name:")}  ${fmt.app(name)}\n`);
@@ -294,5 +256,9 @@ export async function deploy(nameOrPath, path, options) {
   }
 
   // Link this directory to the app
-  linkApp(name, cloud, options.dns, options.dbCloud);
+  if (target.kind === "service") {
+    linkApp(name, null, options.dns, null, target.id);
+  } else {
+    linkApp(name, target.id, options.dns);
+  }
 }

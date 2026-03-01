@@ -1,13 +1,19 @@
 import { randomBytes } from "crypto";
 import { awsQueryApi, awsJsonApi, xmlVal, xmlList, xmlBlock } from "../../clouds/aws.js";
-import { getAppConfig, pushAppConfig } from "./app.js";
+import { getCloudMeta, setCloudMeta } from "../../config.js";
 
-function instanceName(appName) {
-  return `relight-${appName}`;
+var SHARED_INSTANCE = "relight-shared";
+
+function userName(name) {
+  return `app_${name.replace(/-/g, "_")}`;
 }
 
-function dbName(appName) {
-  return `relight_${appName.replace(/-/g, "_")}`;
+function dbName(name) {
+  return `relight_${name.replace(/-/g, "_")}`;
+}
+
+function isSharedInstance(dbId) {
+  return dbId === SHARED_INSTANCE;
 }
 
 async function connectPg(connectionUrl) {
@@ -84,63 +90,6 @@ async function ensureSecurityGroup(cfg) {
   return newSgId;
 }
 
-// --- Get DB password from App Runner env ---
-
-async function getDbPassword(cfg, appName) {
-  var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
-
-  // Find App Runner service and extract DB_TOKEN
-  var nextToken = null;
-  do {
-    var params = {};
-    if (nextToken) params.NextToken = nextToken;
-    var res = await awsJsonApi("AppRunner.ListServices", params, "apprunner", cr, cfg.region);
-
-    var svcName = `relight-${appName}`;
-    var match = (res.ServiceSummaryList || []).find((s) => s.ServiceName === svcName);
-    if (match) {
-      var descRes = await awsJsonApi(
-        "AppRunner.DescribeService",
-        { ServiceArn: match.ServiceArn },
-        "apprunner",
-        cr,
-        cfg.region
-      );
-      var envVars = descRes.Service?.SourceConfiguration?.ImageRepository?.ImageConfiguration?.RuntimeEnvironmentVariables || {};
-      if (envVars.DB_TOKEN) return envVars.DB_TOKEN;
-      throw new Error("DB_TOKEN not found on service.");
-    }
-
-    nextToken = res.NextToken;
-  } while (nextToken);
-
-  throw new Error(`Service relight-${appName} not found.`);
-}
-
-// --- Get connection URL ---
-
-async function getConnectionUrl(cfg, appName, password) {
-  var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
-  var instName = instanceName(appName);
-  var database = dbName(appName);
-
-  var xml = await awsQueryApi(
-    "DescribeDBInstances",
-    { DBInstanceIdentifier: instName },
-    "rds",
-    cr,
-    cfg.region
-  );
-
-  var endpointBlock = xmlBlock(xml, "Endpoint");
-  if (!endpointBlock) throw new Error("No endpoint found for RDS instance.");
-
-  var host = xmlVal(endpointBlock, "Address");
-  var port = xmlVal(endpointBlock, "Port") || "5432";
-
-  return `postgresql://relight:${encodeURIComponent(password)}@${host}:${port}/${database}`;
-}
-
 // --- Poll for RDS instance to become available ---
 
 async function waitForInstance(cfg, instName) {
@@ -166,40 +115,59 @@ async function waitForInstance(cfg, instName) {
   throw new Error("Timed out waiting for RDS instance to become available.");
 }
 
-// --- Public API ---
+// --- Get RDS endpoint ---
 
-export async function createDatabase(cfg, appName, opts = {}) {
-  if (!opts.skipAppConfig) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig) {
-      throw new Error(`App ${appName} not found.`);
-    }
-    if (appConfig.dbId) {
-      throw new Error(`App ${appName} already has a database: ${appConfig.dbId}`);
+function getRdsEndpoint(xml) {
+  var endpointBlock = xmlBlock(xml, "Endpoint");
+  if (!endpointBlock) return null;
+  var host = xmlVal(endpointBlock, "Address");
+  var port = xmlVal(endpointBlock, "Port") || "5432";
+  return { host, port };
+}
+
+// --- Shared instance management ---
+
+async function getOrCreateSharedInstance(cfg) {
+  var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
+  var meta = getCloudMeta("aws", "sharedDb");
+
+  if (meta && meta.instance) {
+    // Verify instance still exists
+    try {
+      var xml = await awsQueryApi(
+        "DescribeDBInstances",
+        { DBInstanceIdentifier: SHARED_INSTANCE },
+        "rds",
+        cr,
+        cfg.region
+      );
+      var endpoint = getRdsEndpoint(xml);
+      if (endpoint && endpoint.host !== meta.host) {
+        meta.host = endpoint.host;
+        meta.port = endpoint.port;
+        setCloudMeta("aws", "sharedDb", meta);
+      }
+      return meta;
+    } catch (e) {
+      // Instance gone, recreate
     }
   }
 
-  var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
-  var instName = instanceName(appName);
-  var database = dbName(appName);
-
-  // Ensure security group for public access
+  // Create shared RDS instance
   var sgId = await ensureSecurityGroup(cfg);
+  var masterPassword = randomBytes(24).toString("base64url");
 
-  // Generate password
-  var password = randomBytes(24).toString("base64url");
-
-  // Create RDS instance
+  process.stderr.write("  Creating shared RDS instance (one-time, takes 5-15 minutes)...\n");
   await awsQueryApi(
     "CreateDBInstance",
     {
-      DBInstanceIdentifier: instName,
+      DBInstanceIdentifier: SHARED_INSTANCE,
       DBInstanceClass: "db.t4g.micro",
       Engine: "postgres",
       EngineVersion: "15",
-      MasterUsername: "relight",
-      MasterUserPassword: password,
-      DBName: database,
+      MasterUsername: "relight_admin",
+      MasterUserPassword: masterPassword,
+      DBName: "postgres",
       AllocatedStorage: "20",
       PubliclyAccessible: "true",
       "VpcSecurityGroupIds.member.1": sgId,
@@ -210,91 +178,139 @@ export async function createDatabase(cfg, appName, opts = {}) {
     cfg.region
   );
 
-  // Wait for instance to become available (5-15 min)
-  process.stderr.write("  Waiting for RDS instance (this takes 5-15 minutes)...\n");
-  await waitForInstance(cfg, instName);
+  await waitForInstance(cfg, SHARED_INSTANCE);
 
-  // Get connection URL
-  var connectionUrl = await getConnectionUrl(cfg, appName, password);
+  // Get endpoint
+  var xml = await awsQueryApi(
+    "DescribeDBInstances",
+    { DBInstanceIdentifier: SHARED_INSTANCE },
+    "rds",
+    cr,
+    cfg.region
+  );
+  var endpoint = getRdsEndpoint(xml);
+  if (!endpoint || !endpoint.host) throw new Error("No endpoint found for shared RDS instance.");
 
-  if (!opts.skipAppConfig) {
-    // Store in app config
-    appConfig.dbId = instName;
-    appConfig.dbName = database;
+  meta = {
+    instance: SHARED_INSTANCE,
+    host: endpoint.host,
+    port: endpoint.port,
+    masterPassword,
+  };
+  setCloudMeta("aws", "sharedDb", meta);
 
-    if (!appConfig.envKeys) appConfig.envKeys = [];
-    if (!appConfig.secretKeys) appConfig.secretKeys = [];
-    if (!appConfig.env) appConfig.env = {};
+  return meta;
+}
 
-    appConfig.env["DATABASE_URL"] = connectionUrl;
-    if (!appConfig.envKeys.includes("DATABASE_URL")) appConfig.envKeys.push("DATABASE_URL");
+async function connectAsAdmin(cfg) {
+  var meta = getCloudMeta("aws", "sharedDb");
+  if (!meta || !meta.masterPassword) {
+    throw new Error("Shared DB master credentials not found. Run `relight db create` first.");
+  }
+  var url = `postgresql://relight_admin:${encodeURIComponent(meta.masterPassword)}@${meta.host}:${meta.port}/postgres`;
+  var client = await connectPg(url);
+  return { client, meta };
+}
 
-    appConfig.env["DB_TOKEN"] = "[hidden]";
-    appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
-    appConfig.secretKeys.push("DB_TOKEN");
-    appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
-
-    var newSecrets = { DB_TOKEN: password };
-    await pushAppConfig(cfg, appName, appConfig, { newSecrets });
+async function destroySharedInstanceIfEmpty(cfg) {
+  var { client } = await connectAsAdmin(cfg);
+  try {
+    var res = await client.query(
+      "SELECT datname FROM pg_database WHERE datname LIKE 'relight_%'"
+    );
+    if (res.rows.length > 0) return false;
+  } finally {
+    await client.end();
   }
 
+  // No relight databases remain - destroy the shared instance
+  var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
+  await awsQueryApi(
+    "DeleteDBInstance",
+    { DBInstanceIdentifier: SHARED_INSTANCE, SkipFinalSnapshot: "true" },
+    "rds",
+    cr,
+    cfg.region
+  );
+  setCloudMeta("aws", "sharedDb", undefined);
+  return true;
+}
+
+// --- Public API ---
+
+export async function createDatabase(cfg, name, opts = {}) {
+  var meta = await getOrCreateSharedInstance(cfg);
+  var database = dbName(name);
+  var user = userName(name);
+  var password = randomBytes(24).toString("base64url");
+
+  // Connect as admin to create database and user
+  var adminUrl = `postgresql://relight_admin:${encodeURIComponent(meta.masterPassword)}@${meta.host}:${meta.port}/postgres`;
+  var client = await connectPg(adminUrl);
+  try {
+    await client.query(`CREATE USER ${user} WITH PASSWORD '${password.replace(/'/g, "''")}'`);
+    await client.query(`CREATE DATABASE ${database} OWNER ${user}`);
+  } finally {
+    await client.end();
+  }
+
+  var connectionUrl = `postgresql://${user}:${encodeURIComponent(password)}@${meta.host}:${meta.port}/${database}`;
+
   return {
-    dbId: instName,
+    dbId: SHARED_INSTANCE,
     dbName: database,
+    dbUser: user,
     dbToken: password,
     connectionUrl,
   };
 }
 
-export async function destroyDatabase(cfg, appName, opts = {}) {
+export async function destroyDatabase(cfg, name, opts = {}) {
   var dbId = opts.dbId;
   if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
+    throw new Error("dbId is required to destroy an AWS database.");
   }
 
-  var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
-
-  await awsQueryApi(
-    "DeleteDBInstance",
-    { DBInstanceIdentifier: dbId, SkipFinalSnapshot: "true" },
-    "rds",
-    cr,
-    cfg.region
-  );
-
-  if (!opts.dbId) {
-    delete appConfig.dbId;
-    delete appConfig.dbName;
-
-    if (appConfig.env) {
-      delete appConfig.env["DATABASE_URL"];
-      delete appConfig.env["DB_TOKEN"];
-    }
-    if (appConfig.envKeys) appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DATABASE_URL");
-    if (appConfig.secretKeys) appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
-
-    await pushAppConfig(cfg, appName, appConfig);
+  // Legacy per-app instance: delete the whole instance
+  if (!isSharedInstance(dbId)) {
+    var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
+    await awsQueryApi(
+      "DeleteDBInstance",
+      { DBInstanceIdentifier: dbId, SkipFinalSnapshot: "true" },
+      "rds",
+      cr,
+      cfg.region
+    );
+    return;
   }
+
+  // Shared instance: drop database and user
+  var database = dbName(name);
+  var user = userName(name);
+
+  var { client } = await connectAsAdmin(cfg);
+  try {
+    // Terminate active connections to the database
+    await client.query(
+      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${database}' AND pid <> pg_backend_pid()`
+    );
+    await client.query(`DROP DATABASE IF EXISTS ${database}`);
+    await client.query(`DROP USER IF EXISTS ${user}`);
+  } finally {
+    await client.end();
+  }
+
+  // Check if shared instance should be destroyed
+  await destroySharedInstanceIfEmpty(cfg);
 }
 
-export async function getDatabaseInfo(cfg, appName, opts = {}) {
+export async function getDatabaseInfo(cfg, name, opts = {}) {
   var dbId = opts.dbId;
-  var dbNameVal;
   if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
-    dbNameVal = appConfig.dbName;
-  } else {
-    dbNameVal = dbName(appName);
+    throw new Error("dbId is required to get AWS database info.");
   }
 
+  var database = dbName(name);
   var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
   var xml = await awsQueryApi(
     "DescribeDBInstances",
@@ -304,17 +320,16 @@ export async function getDatabaseInfo(cfg, appName, opts = {}) {
     cfg.region
   );
 
-  var endpointBlock = xmlBlock(xml, "Endpoint");
-  var host = endpointBlock ? xmlVal(endpointBlock, "Address") : null;
-  var port = endpointBlock ? (xmlVal(endpointBlock, "Port") || "5432") : "5432";
+  var endpoint = getRdsEndpoint(xml);
+  var displayUser = isSharedInstance(dbId) ? userName(name) : "relight";
 
-  var connectionUrl = host
-    ? `postgresql://relight:****@${host}:${port}/${dbNameVal}`
+  var connectionUrl = endpoint
+    ? `postgresql://${displayUser}:****@${endpoint.host}:${endpoint.port}/${database}`
     : null;
 
   return {
     dbId,
-    dbName: dbNameVal,
+    dbName: database,
     connectionUrl,
     size: null,
     numTables: null,
@@ -322,17 +337,12 @@ export async function getDatabaseInfo(cfg, appName, opts = {}) {
   };
 }
 
-export async function queryDatabase(cfg, appName, sql, params, opts = {}) {
-  if (!opts.dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
+export async function queryDatabase(cfg, name, sql, params, opts = {}) {
+  if (!opts.connectionUrl) {
+    throw new Error("connectionUrl is required to query an AWS database.");
   }
 
-  var password = await getDbPassword(cfg, appName);
-  var connectionUrl = await getConnectionUrl(cfg, appName, password);
-  var client = await connectPg(connectionUrl);
+  var client = await connectPg(opts.connectionUrl);
 
   try {
     var result = await client.query(sql, params || []);
@@ -345,17 +355,12 @@ export async function queryDatabase(cfg, appName, sql, params, opts = {}) {
   }
 }
 
-export async function importDatabase(cfg, appName, sqlContent, opts = {}) {
-  if (!opts.dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
+export async function importDatabase(cfg, name, sqlContent, opts = {}) {
+  if (!opts.connectionUrl) {
+    throw new Error("connectionUrl is required to import into an AWS database.");
   }
 
-  var password = await getDbPassword(cfg, appName);
-  var connectionUrl = await getConnectionUrl(cfg, appName, password);
-  var client = await connectPg(connectionUrl);
+  var client = await connectPg(opts.connectionUrl);
 
   try {
     await client.query(sqlContent);
@@ -364,21 +369,13 @@ export async function importDatabase(cfg, appName, sqlContent, opts = {}) {
   }
 }
 
-export async function exportDatabase(cfg, appName, opts = {}) {
-  var database;
-  if (!opts.dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    database = appConfig.dbName;
-  } else {
-    database = dbName(appName);
+export async function exportDatabase(cfg, name, opts = {}) {
+  if (!opts.connectionUrl) {
+    throw new Error("connectionUrl is required to export an AWS database.");
   }
 
-  var password = await getDbPassword(cfg, appName);
-  var connectionUrl = await getConnectionUrl(cfg, appName, password);
-  var client = await connectPg(connectionUrl);
+  var database = dbName(name);
+  var client = await connectPg(opts.connectionUrl);
 
   try {
     var tablesRes = await client.query(
@@ -433,68 +430,62 @@ export async function exportDatabase(cfg, appName, opts = {}) {
   }
 }
 
-export async function rotateToken(cfg, appName, opts = {}) {
+export async function rotateToken(cfg, name, opts = {}) {
   var dbId = opts.dbId;
   if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
+    throw new Error("dbId is required to rotate an AWS database token.");
   }
 
-  var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
   var newPassword = randomBytes(24).toString("base64url");
+  var connectionUrl;
+  var database = dbName(name);
 
-  // Update RDS master password
-  await awsQueryApi(
-    "ModifyDBInstance",
-    {
-      DBInstanceIdentifier: dbId,
-      MasterUserPassword: newPassword,
-    },
-    "rds",
-    cr,
-    cfg.region
-  );
-
-  // Get connection URL with new password
-  var connectionUrl = await getConnectionUrl(cfg, appName, newPassword);
-
-  if (!opts.skipAppConfig) {
-    if (!appConfig) {
-      appConfig = await getAppConfig(cfg, appName);
+  if (isSharedInstance(dbId)) {
+    // Update via admin connection
+    var user = userName(name);
+    var { client, meta } = await connectAsAdmin(cfg);
+    try {
+      await client.query(`ALTER USER ${user} WITH PASSWORD '${newPassword.replace(/'/g, "''")}'`);
+    } finally {
+      await client.end();
     }
+    connectionUrl = `postgresql://${user}:${encodeURIComponent(newPassword)}@${meta.host}:${meta.port}/${database}`;
+  } else {
+    // Legacy: update RDS master password
+    var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
+    await awsQueryApi(
+      "ModifyDBInstance",
+      {
+        DBInstanceIdentifier: dbId,
+        MasterUserPassword: newPassword,
+      },
+      "rds",
+      cr,
+      cfg.region
+    );
 
-    // Update app config
-    if (!appConfig.envKeys) appConfig.envKeys = [];
-    if (!appConfig.secretKeys) appConfig.secretKeys = [];
-    if (!appConfig.env) appConfig.env = {};
-
-    appConfig.env["DB_TOKEN"] = "[hidden]";
-    if (!appConfig.secretKeys.includes("DB_TOKEN")) appConfig.secretKeys.push("DB_TOKEN");
-    appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
-
-    appConfig.env["DATABASE_URL"] = connectionUrl;
-    if (!appConfig.envKeys.includes("DATABASE_URL")) appConfig.envKeys.push("DATABASE_URL");
-
-    await pushAppConfig(cfg, appName, appConfig, { newSecrets: { DB_TOKEN: newPassword } });
+    var xml = await awsQueryApi(
+      "DescribeDBInstances",
+      { DBInstanceIdentifier: dbId },
+      "rds",
+      cr,
+      cfg.region
+    );
+    var endpoint = getRdsEndpoint(xml);
+    connectionUrl = endpoint
+      ? `postgresql://relight:${encodeURIComponent(newPassword)}@${endpoint.host}:${endpoint.port}/${database}`
+      : null;
   }
 
   return { dbToken: newPassword, connectionUrl };
 }
 
-export async function resetDatabase(cfg, appName, opts = {}) {
-  if (!opts.dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
+export async function resetDatabase(cfg, name, opts = {}) {
+  if (!opts.connectionUrl) {
+    throw new Error("connectionUrl is required to reset an AWS database.");
   }
 
-  var password = await getDbPassword(cfg, appName);
-  var connectionUrl = await getConnectionUrl(cfg, appName, password);
-  var client = await connectPg(connectionUrl);
+  var client = await connectPg(opts.connectionUrl);
 
   try {
     var tablesRes = await client.query(

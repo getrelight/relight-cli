@@ -1,6 +1,6 @@
 import { phase, status, fatal, fmt, table } from "../lib/output.js";
 import { resolveAppName } from "../lib/link.js";
-import { resolveCloudId, getCloudCfg, getProvider } from "../lib/providers/resolve.js";
+import { resolveTarget } from "../lib/providers/resolve.js";
 
 // --- Pricing (Workers Paid plan, $5/mo) ---
 
@@ -456,9 +456,9 @@ function renderAwsFleet(appResults, range) {
 // --- Main command ---
 
 export async function cost(name, options) {
-  var cloud = resolveCloudId(options.cloud);
-  var cfg = getCloudCfg(cloud);
-  var appProvider = await getProvider(cloud, "app");
+  var target = await resolveTarget(options);
+  var cfg = target.cfg;
+  var appProvider = await target.provider("app");
 
   var range = parseDateRange(options.since);
 
@@ -477,7 +477,7 @@ export async function cost(name, options) {
     );
   }
 
-  if (cloud === "aws") {
+  if (target.type === "aws") {
     // AWS rendering
     if (options.json) {
       var jsonOut = singleApp
@@ -512,7 +512,7 @@ export async function cost(name, options) {
     return;
   }
 
-  if (cloud === "gcp") {
+  if (target.type === "gcp") {
     // GCP rendering
     if (options.json) {
       var jsonOut = singleApp

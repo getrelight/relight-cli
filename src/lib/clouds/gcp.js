@@ -59,7 +59,7 @@ export async function mintAccessToken(clientEmail, privateKey) {
   var res = await fetch(TOKEN_URI, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=${encodeURIComponent("urn:ietf:params:oauth:grant_type:jwt-bearer")}&assertion=${encodeURIComponent(jwt)}`,
+    body: `grant_type=${encodeURIComponent("urn:ietf:params:oauth:grant-type:jwt-bearer")}&assertion=${encodeURIComponent(jwt)}`,
   });
 
   if (!res.ok) {
@@ -300,6 +300,26 @@ export async function updateSqlUser(token, project, instanceName, userName, pass
     token
   );
   return waitForSqlOperation(token, project, op.name);
+}
+
+export async function deleteSqlUser(token, project, instanceName, userName) {
+  var op = await gcpApi(
+    "DELETE",
+    `${SQLADMIN_API}/projects/${project}/instances/${instanceName}/users?name=${encodeURIComponent(userName)}`,
+    null,
+    token
+  );
+  return waitForSqlOperation(token, project, op.name);
+}
+
+export async function listSqlDatabases(token, project, instanceName) {
+  var res = await gcpApi(
+    "GET",
+    `${SQLADMIN_API}/projects/${project}/instances/${instanceName}/databases`,
+    null,
+    token
+  );
+  return res.items || [];
 }
 
 // --- Cloud DNS ---

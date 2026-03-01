@@ -1,5 +1,6 @@
 import { resolveCloud } from "../link.js";
-import { getDefaultCloud, resolveCloudConfig, CLOUD_NAMES } from "../config.js";
+import { resolveCompute } from "../link.js";
+import { getDefaultCloud, resolveCloudConfig, CLOUD_NAMES, tryGetServiceConfig, normalizeServiceConfig } from "../config.js";
 import { fatal, fmt } from "../output.js";
 
 var LAYERS = ["app", "dns", "db", "registry"];
@@ -13,7 +14,6 @@ export function getProvider(cloudId, layer) {
     cf: () => import(`./cf/${layer}.js`),
     gcp: () => import(`./gcp/${layer}.js`),
     aws: () => import(`./aws/${layer}.js`),
-    slicervm: () => import(`./slicervm/${layer}.js`),
   };
 
   if (!providers[cloudId]) {
@@ -32,7 +32,7 @@ export function resolveCloudId(cloudFlag) {
   if (!cloud) {
     fatal(
       "No cloud specified.",
-      `Use ${fmt.cmd("--cloud <cf|gcp|aws|slicervm>")} or set a default with ${fmt.cmd("relight auth")}.`
+      `Use ${fmt.cmd("--cloud <cf|gcp|aws>")} or set a default with ${fmt.cmd("relight auth")}.`
     );
   }
   if (!CLOUD_NAMES[cloud]) {
@@ -46,4 +46,34 @@ export function resolveCloudId(cloudFlag) {
 
 export function getCloudCfg(cloudId) {
   return resolveCloudConfig(cloudId);
+}
+
+export async function resolveTarget(options) {
+  // Check if --compute points to a service
+  var computeName = options.compute || resolveCompute();
+  if (computeName) {
+    var service = tryGetServiceConfig(computeName);
+    if (service) {
+      var serviceType = service.type;
+      return {
+        kind: "service",
+        id: computeName,
+        layer: service.layer,
+        type: serviceType,
+        cfg: normalizeServiceConfig(service),
+        provider: (layer) => import(`./${serviceType}/${layer}.js`),
+      };
+    }
+  }
+
+  // Fall back to cloud
+  var cloud = resolveCloudId(options.cloud);
+  var cfg = resolveCloudConfig(cloud);
+  return {
+    kind: "cloud",
+    id: cloud,
+    type: cloud,
+    cfg,
+    provider: (layer) => getProvider(cloud, layer),
+  };
 }

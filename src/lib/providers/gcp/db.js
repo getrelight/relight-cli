@@ -5,32 +5,26 @@ import {
   getSqlInstance,
   deleteSqlInstance,
   createSqlDatabase,
+  deleteSqlDatabase,
   createSqlUser,
   updateSqlUser,
+  deleteSqlUser,
+  listSqlDatabases,
 } from "../../clouds/gcp.js";
-import { getAppConfig, pushAppConfig } from "./app.js";
+import { getCloudMeta, setCloudMeta } from "../../config.js";
 
-function instanceName(appName) {
-  return `relight-${appName}`;
+var SHARED_INSTANCE = "relight-shared";
+
+function userName(name) {
+  return `app_${name.replace(/-/g, "_")}`;
 }
 
-function dbName(appName) {
-  return `relight_${appName}`;
+function dbName(name) {
+  return `relight_${name.replace(/-/g, "_")}`;
 }
 
-async function getDbPassword(cfg, appName) {
-  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
-
-  // Read from Cloud Run service env vars
-  var { listAllServices } = await import("../../clouds/gcp.js");
-  var all = await listAllServices(token, cfg.project);
-  var svc = all.find((s) => s.name.split("/").pop() === `relight-${appName}`);
-  if (!svc) throw new Error(`Service relight-${appName} not found.`);
-
-  var envVars = svc.template?.containers?.[0]?.env || [];
-  var dbToken = envVars.find((e) => e.name === "DB_TOKEN");
-  if (!dbToken) throw new Error("DB_TOKEN not found on service.");
-  return dbToken.value;
+function isSharedInstance(dbId) {
+  return dbId === SHARED_INSTANCE;
 }
 
 async function connectPg(connectionUrl) {
@@ -41,27 +35,37 @@ async function connectPg(connectionUrl) {
   return client;
 }
 
-export async function createDatabase(cfg, appName, opts = {}) {
-  var region = "us-central1";
+function getPublicIp(instance) {
+  for (var addr of (instance.ipAddresses || [])) {
+    if (addr.type === "PRIMARY") return addr.ipAddress;
+  }
+  return null;
+}
 
-  if (!opts.skipAppConfig) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig) {
-      throw new Error(`App ${appName} not found.`);
+async function getOrCreateSharedInstance(cfg, region) {
+  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
+  var meta = getCloudMeta("gcp", "sharedDb");
+
+  if (meta && meta.instance) {
+    // Verify instance still exists
+    try {
+      var instance = await getSqlInstance(token, cfg.project, SHARED_INSTANCE);
+      var ip = getPublicIp(instance);
+      if (ip && ip !== meta.ip) {
+        meta.ip = ip;
+        setCloudMeta("gcp", "sharedDb", meta);
+      }
+      return { token, ip: ip || meta.ip, meta };
+    } catch (e) {
+      // Instance gone, recreate
     }
-    if (appConfig.dbId) {
-      throw new Error(`App ${appName} already has a database: ${appConfig.dbId}`);
-    }
-    region = appConfig.regions?.[0] || "us-central1";
   }
 
-  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
-  var instName = instanceName(appName);
-
-  // Create Cloud SQL instance
+  // Create shared instance
+  process.stderr.write("  Creating shared Cloud SQL instance (one-time, takes 5-15 minutes)...\n");
   await createSqlInstance(token, cfg.project, {
-    name: instName,
-    region,
+    name: SHARED_INSTANCE,
+    region: region || "us-central1",
     databaseVersion: "POSTGRES_15",
     settings: {
       tier: "db-f1-micro",
@@ -75,115 +79,138 @@ export async function createDatabase(cfg, appName, opts = {}) {
     },
   });
 
-  // Create database
-  var database = dbName(appName);
-  await createSqlDatabase(token, cfg.project, instName, database);
+  // Create master user with random password
+  var masterPassword = randomBytes(24).toString("base64url");
+  await createSqlUser(token, cfg.project, SHARED_INSTANCE, "relight_admin", masterPassword);
 
-  // Create user with random password
+  var instance = await getSqlInstance(token, cfg.project, SHARED_INSTANCE);
+  var ip = getPublicIp(instance);
+  if (!ip) throw new Error("No public IP assigned to shared Cloud SQL instance.");
+
+  meta = { instance: SHARED_INSTANCE, ip, masterPassword };
+  setCloudMeta("gcp", "sharedDb", meta);
+
+  return { token, ip, meta };
+}
+
+async function connectAsAdmin(cfg) {
+  var meta = getCloudMeta("gcp", "sharedDb");
+  if (!meta || !meta.masterPassword) {
+    throw new Error("Shared DB master credentials not found. Run `relight db create` first.");
+  }
+
+  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
+  var instance = await getSqlInstance(token, cfg.project, SHARED_INSTANCE);
+  var ip = getPublicIp(instance);
+  if (!ip) throw new Error("No public IP on shared instance.");
+
+  var url = `postgresql://relight_admin:${encodeURIComponent(meta.masterPassword)}@${ip}:5432/postgres`;
+  var client = await connectPg(url);
+  return { client, ip };
+}
+
+async function destroySharedInstanceIfEmpty(cfg) {
+  var { client } = await connectAsAdmin(cfg);
+  try {
+    var res = await client.query(
+      "SELECT datname FROM pg_database WHERE datname LIKE 'relight_%'"
+    );
+    if (res.rows.length > 0) return false;
+  } finally {
+    await client.end();
+  }
+
+  // No relight databases remain - destroy the shared instance
+  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
+  await deleteSqlInstance(token, cfg.project, SHARED_INSTANCE);
+  setCloudMeta("gcp", "sharedDb", undefined);
+  return true;
+}
+
+// --- Public API ---
+
+export async function createDatabase(cfg, name, opts = {}) {
+  var region = opts.location || "us-central1";
+
+  var { token, ip, meta } = await getOrCreateSharedInstance(cfg, region);
+  var database = dbName(name);
+  var user = userName(name);
   var password = randomBytes(24).toString("base64url");
-  await createSqlUser(token, cfg.project, instName, "relight", password);
 
-  // Get public IP
-  var instance = await getSqlInstance(token, cfg.project, instName);
-  var publicIp = null;
-  for (var addr of (instance.ipAddresses || [])) {
-    if (addr.type === "PRIMARY") {
-      publicIp = addr.ipAddress;
-      break;
-    }
+  // Connect as admin to create database and user
+  var adminUrl = `postgresql://relight_admin:${encodeURIComponent(meta.masterPassword)}@${ip}:5432/postgres`;
+  var client = await connectPg(adminUrl);
+  try {
+    await client.query(`CREATE USER ${user} WITH PASSWORD '${password.replace(/'/g, "''")}'`);
+    await client.query(`CREATE DATABASE ${database} OWNER ${user}`);
+  } finally {
+    await client.end();
   }
 
-  if (!publicIp) throw new Error("No public IP assigned to Cloud SQL instance.");
-
-  var connectionUrl = `postgresql://relight:${encodeURIComponent(password)}@${publicIp}:5432/${database}`;
-
-  if (!opts.skipAppConfig) {
-    // Store in app config
-    appConfig.dbId = instName;
-    appConfig.dbName = database;
-
-    if (!appConfig.envKeys) appConfig.envKeys = [];
-    if (!appConfig.secretKeys) appConfig.secretKeys = [];
-    if (!appConfig.env) appConfig.env = {};
-
-    appConfig.env["DATABASE_URL"] = connectionUrl;
-    if (!appConfig.envKeys.includes("DATABASE_URL")) appConfig.envKeys.push("DATABASE_URL");
-
-    appConfig.env["DB_TOKEN"] = "[hidden]";
-    appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
-    appConfig.secretKeys.push("DB_TOKEN");
-    appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
-
-    var newSecrets = { DB_TOKEN: password };
-    await pushAppConfig(cfg, appName, appConfig, { newSecrets });
-  }
+  var connectionUrl = `postgresql://${user}:${encodeURIComponent(password)}@${ip}:5432/${database}`;
 
   return {
-    dbId: instName,
+    dbId: SHARED_INSTANCE,
     dbName: database,
+    dbUser: user,
     dbToken: password,
     connectionUrl,
   };
 }
 
-export async function destroyDatabase(cfg, appName, opts = {}) {
+export async function destroyDatabase(cfg, name, opts = {}) {
   var dbId = opts.dbId;
   if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
+    throw new Error("dbId is required to destroy a GCP database.");
   }
 
-  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
-  await deleteSqlInstance(token, cfg.project, dbId);
-
-  if (!opts.dbId) {
-    delete appConfig.dbId;
-    delete appConfig.dbName;
-
-    if (appConfig.env) {
-      delete appConfig.env["DATABASE_URL"];
-      delete appConfig.env["DB_TOKEN"];
-    }
-    if (appConfig.envKeys) appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DATABASE_URL");
-    if (appConfig.secretKeys) appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
-
-    await pushAppConfig(cfg, appName, appConfig);
+  // Legacy per-app instance: delete the whole instance
+  if (!isSharedInstance(dbId)) {
+    var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
+    await deleteSqlInstance(token, cfg.project, dbId);
+    return;
   }
+
+  // Shared instance: drop database and user
+  var database = dbName(name);
+  var user = userName(name);
+
+  var { client } = await connectAsAdmin(cfg);
+  try {
+    // Terminate active connections to the database
+    await client.query(
+      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${database}' AND pid <> pg_backend_pid()`
+    );
+    await client.query(`DROP DATABASE IF EXISTS ${database}`);
+    await client.query(`DROP USER IF EXISTS ${user}`);
+  } finally {
+    await client.end();
+  }
+
+  // Check if shared instance should be destroyed
+  await destroySharedInstanceIfEmpty(cfg);
 }
 
-export async function getDatabaseInfo(cfg, appName, opts = {}) {
+export async function getDatabaseInfo(cfg, name, opts = {}) {
   var dbId = opts.dbId;
-  var dbNameVal;
   if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
-    dbNameVal = appConfig.dbName;
+    throw new Error("dbId is required to get GCP database info.");
   }
 
   var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
   var instance = await getSqlInstance(token, cfg.project, dbId);
+  var publicIp = getPublicIp(instance);
 
-  var publicIp = null;
-  for (var addr of (instance.ipAddresses || [])) {
-    if (addr.type === "PRIMARY") {
-      publicIp = addr.ipAddress;
-      break;
-    }
-  }
+  var displayUser = isSharedInstance(dbId) ? userName(name) : "relight";
+  var database = dbName(name);
 
   var connectionUrl = publicIp
-    ? `postgresql://relight:****@${publicIp}:5432/${appConfig.dbName}`
+    ? `postgresql://${displayUser}:****@${publicIp}:5432/${database}`
     : null;
 
   return {
     dbId,
-    dbName: dbNameVal || dbName(appName),
+    dbName: database,
     connectionUrl,
     size: null,
     numTables: null,
@@ -191,34 +218,12 @@ export async function getDatabaseInfo(cfg, appName, opts = {}) {
   };
 }
 
-export async function queryDatabase(cfg, appName, sql, params, opts = {}) {
-  var dbId = opts.dbId;
-  var database;
-  if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
-    database = appConfig.dbName;
-  } else {
-    database = dbName(appName);
+export async function queryDatabase(cfg, name, sql, params, opts = {}) {
+  if (!opts.connectionUrl) {
+    throw new Error("connectionUrl is required to query a GCP database.");
   }
 
-  var password = await getDbPassword(cfg, appName);
-  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
-  var instance = await getSqlInstance(token, cfg.project, dbId);
-
-  var publicIp = null;
-  for (var addr of (instance.ipAddresses || [])) {
-    if (addr.type === "PRIMARY") {
-      publicIp = addr.ipAddress;
-      break;
-    }
-  }
-
-  var connectionUrl = `postgresql://relight:${encodeURIComponent(password)}@${publicIp}:5432/${database}`;
-  var client = await connectPg(connectionUrl);
+  var client = await connectPg(opts.connectionUrl);
 
   try {
     var result = await client.query(sql, params || []);
@@ -231,34 +236,12 @@ export async function queryDatabase(cfg, appName, sql, params, opts = {}) {
   }
 }
 
-export async function importDatabase(cfg, appName, sqlContent, opts = {}) {
-  var dbId = opts.dbId;
-  var database;
-  if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
-    database = appConfig.dbName;
-  } else {
-    database = dbName(appName);
+export async function importDatabase(cfg, name, sqlContent, opts = {}) {
+  if (!opts.connectionUrl) {
+    throw new Error("connectionUrl is required to import into a GCP database.");
   }
 
-  var password = await getDbPassword(cfg, appName);
-  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
-  var instance = await getSqlInstance(token, cfg.project, dbId);
-
-  var publicIp = null;
-  for (var addr of (instance.ipAddresses || [])) {
-    if (addr.type === "PRIMARY") {
-      publicIp = addr.ipAddress;
-      break;
-    }
-  }
-
-  var connectionUrl = `postgresql://relight:${encodeURIComponent(password)}@${publicIp}:5432/${database}`;
-  var client = await connectPg(connectionUrl);
+  var client = await connectPg(opts.connectionUrl);
 
   try {
     await client.query(sqlContent);
@@ -267,34 +250,13 @@ export async function importDatabase(cfg, appName, sqlContent, opts = {}) {
   }
 }
 
-export async function exportDatabase(cfg, appName, opts = {}) {
-  var dbId = opts.dbId;
-  var database;
-  if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
-    database = appConfig.dbName;
-  } else {
-    database = dbName(appName);
+export async function exportDatabase(cfg, name, opts = {}) {
+  if (!opts.connectionUrl) {
+    throw new Error("connectionUrl is required to export a GCP database.");
   }
 
-  var password = await getDbPassword(cfg, appName);
-  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
-  var instance = await getSqlInstance(token, cfg.project, dbId);
-
-  var publicIp = null;
-  for (var addr of (instance.ipAddresses || [])) {
-    if (addr.type === "PRIMARY") {
-      publicIp = addr.ipAddress;
-      break;
-    }
-  }
-
-  var connectionUrl = `postgresql://relight:${encodeURIComponent(password)}@${publicIp}:5432/${database}`;
-  var client = await connectPg(connectionUrl);
+  var database = dbName(name);
+  var client = await connectPg(opts.connectionUrl);
 
   try {
     // Get all user tables
@@ -352,93 +314,46 @@ export async function exportDatabase(cfg, appName, opts = {}) {
   }
 }
 
-export async function rotateToken(cfg, appName, opts = {}) {
+export async function rotateToken(cfg, name, opts = {}) {
   var dbId = opts.dbId;
-  var database;
   if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
-    database = appConfig.dbName;
-  } else {
-    database = dbName(appName);
+    throw new Error("dbId is required to rotate a GCP database token.");
   }
 
-  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
+  var database = dbName(name);
   var newPassword = randomBytes(24).toString("base64url");
+  var connectionUrl;
 
-  // Update SQL user password
-  await updateSqlUser(token, cfg.project, dbId, "relight", newPassword);
-
-  // Get public IP for connection URL
-  var instance = await getSqlInstance(token, cfg.project, dbId);
-  var publicIp = null;
-  for (var addr of (instance.ipAddresses || [])) {
-    if (addr.type === "PRIMARY") {
-      publicIp = addr.ipAddress;
-      break;
+  if (isSharedInstance(dbId)) {
+    // Update via admin connection
+    var user = userName(name);
+    var { client, ip } = await connectAsAdmin(cfg);
+    try {
+      await client.query(`ALTER USER ${user} WITH PASSWORD '${newPassword.replace(/'/g, "''")}'`);
+    } finally {
+      await client.end();
     }
-  }
-
-  var connectionUrl = publicIp
-    ? `postgresql://relight:${encodeURIComponent(newPassword)}@${publicIp}:5432/${database}`
-    : null;
-
-  if (!opts.skipAppConfig) {
-    if (!appConfig) {
-      appConfig = await getAppConfig(cfg, appName);
-    }
-
-    // Update app config
-    if (!appConfig.envKeys) appConfig.envKeys = [];
-    if (!appConfig.secretKeys) appConfig.secretKeys = [];
-    if (!appConfig.env) appConfig.env = {};
-
-    appConfig.env["DB_TOKEN"] = "[hidden]";
-    if (!appConfig.secretKeys.includes("DB_TOKEN")) appConfig.secretKeys.push("DB_TOKEN");
-    appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
-
-    if (connectionUrl) {
-      appConfig.env["DATABASE_URL"] = connectionUrl;
-      if (!appConfig.envKeys.includes("DATABASE_URL")) appConfig.envKeys.push("DATABASE_URL");
-    }
-
-    await pushAppConfig(cfg, appName, appConfig, { newSecrets: { DB_TOKEN: newPassword } });
+    connectionUrl = `postgresql://${user}:${encodeURIComponent(newPassword)}@${ip}:5432/${database}`;
+  } else {
+    // Legacy: update via Cloud SQL API
+    var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
+    await updateSqlUser(token, cfg.project, dbId, "relight", newPassword);
+    var instance = await getSqlInstance(token, cfg.project, dbId);
+    var publicIp = getPublicIp(instance);
+    connectionUrl = publicIp
+      ? `postgresql://relight:${encodeURIComponent(newPassword)}@${publicIp}:5432/${database}`
+      : null;
   }
 
   return { dbToken: newPassword, connectionUrl };
 }
 
-export async function resetDatabase(cfg, appName, opts = {}) {
-  var dbId = opts.dbId;
-  var database;
-  if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
-    database = appConfig.dbName;
-  } else {
-    database = dbName(appName);
+export async function resetDatabase(cfg, name, opts = {}) {
+  if (!opts.connectionUrl) {
+    throw new Error("connectionUrl is required to reset a GCP database.");
   }
 
-  var password = await getDbPassword(cfg, appName);
-  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
-  var instance = await getSqlInstance(token, cfg.project, dbId);
-
-  var publicIp = null;
-  for (var addr of (instance.ipAddresses || [])) {
-    if (addr.type === "PRIMARY") {
-      publicIp = addr.ipAddress;
-      break;
-    }
-  }
-
-  var connectionUrl = `postgresql://relight:${encodeURIComponent(password)}@${publicIp}:5432/${database}`;
-  var client = await connectPg(connectionUrl);
+  var client = await connectPg(opts.connectionUrl);
 
   try {
     var tablesRes = await client.query(

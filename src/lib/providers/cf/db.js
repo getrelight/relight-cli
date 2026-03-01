@@ -7,110 +7,51 @@ import {
   importD1,
   getWorkersSubdomain,
 } from "../../clouds/cf.js";
-import { getAppConfig, pushAppConfig } from "./app.js";
 import { randomBytes } from "crypto";
 
-export async function createDatabase(cfg, appName, opts = {}) {
-  if (!opts.skipAppConfig) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig) {
-      throw new Error(`App ${appName} not found.`);
-    }
-    if (appConfig.dbId) {
-      throw new Error(`App ${appName} already has a database: ${appConfig.dbName}`);
-    }
-  }
-
-  var dbName = `relight-${appName}`;
-  var result = await createD1Database(cfg.accountId, cfg.apiToken, dbName, {
+export async function createDatabase(cfg, name, opts = {}) {
+  var d1Name = `relight-${name}`;
+  var result = await createD1Database(cfg.accountId, cfg.apiToken, d1Name, {
     locationHint: opts.location,
     jurisdiction: opts.jurisdiction,
   });
 
   var subdomain = await getWorkersSubdomain(cfg.accountId, cfg.apiToken);
   var connectionUrl = subdomain
-    ? `https://relight-${appName}.${subdomain}.workers.dev`
+    ? `https://relight-${name}.${subdomain}.workers.dev`
     : null;
 
   var dbToken = randomBytes(32).toString("hex");
 
-  if (!opts.skipAppConfig) {
-    appConfig.dbId = result.uuid;
-    appConfig.dbName = dbName;
-
-    if (!appConfig.envKeys) appConfig.envKeys = [];
-    if (!appConfig.secretKeys) appConfig.secretKeys = [];
-    if (!appConfig.env) appConfig.env = {};
-
-    if (connectionUrl) {
-      appConfig.env["DB_URL"] = connectionUrl;
-      if (!appConfig.envKeys.includes("DB_URL")) appConfig.envKeys.push("DB_URL");
-    }
-
-    appConfig.env["DB_TOKEN"] = "[hidden]";
-    appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
-    appConfig.secretKeys.push("DB_TOKEN");
-    appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
-
-    var newSecrets = { DB_TOKEN: dbToken };
-
-    await pushAppConfig(cfg, appName, appConfig, { newSecrets });
-  }
-
   return {
     dbId: result.uuid,
-    dbName,
+    dbName: d1Name,
     dbToken,
     connectionUrl,
   };
 }
 
-export async function destroyDatabase(cfg, appName, opts = {}) {
-  var dbId = opts.dbId;
-  if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
-  }
-
-  await deleteD1Database(cfg.accountId, cfg.apiToken, dbId);
-
+export async function destroyDatabase(cfg, name, opts = {}) {
   if (!opts.dbId) {
-    delete appConfig.dbId;
-    delete appConfig.dbName;
-
-    if (appConfig.env) {
-      delete appConfig.env["DB_URL"];
-      delete appConfig.env["DB_TOKEN"];
-    }
-    if (appConfig.envKeys) appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_URL");
-    if (appConfig.secretKeys) appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
-
-    await pushAppConfig(cfg, appName, appConfig);
+    throw new Error("dbId is required to destroy a CF database.");
   }
+  await deleteD1Database(cfg.accountId, cfg.apiToken, opts.dbId);
 }
 
-export async function getDatabaseInfo(cfg, appName, opts = {}) {
-  var dbId = opts.dbId;
-  if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
+export async function getDatabaseInfo(cfg, name, opts = {}) {
+  if (!opts.dbId) {
+    throw new Error("dbId is required to get CF database info.");
   }
 
-  var dbDetails = await getD1Database(cfg.accountId, cfg.apiToken, dbId);
+  var dbDetails = await getD1Database(cfg.accountId, cfg.apiToken, opts.dbId);
   var subdomain = await getWorkersSubdomain(cfg.accountId, cfg.apiToken);
   var connectionUrl = subdomain
-    ? `https://relight-${appName}.${subdomain}.workers.dev`
+    ? `https://relight-${name}.${subdomain}.workers.dev`
     : null;
 
   return {
-    dbId,
-    dbName: dbDetails.name || `relight-${appName}`,
+    dbId: opts.dbId,
+    dbName: dbDetails.name || `relight-${name}`,
     connectionUrl,
     size: dbDetails.file_size,
     numTables: dbDetails.num_tables,
@@ -118,27 +59,18 @@ export async function getDatabaseInfo(cfg, appName, opts = {}) {
   };
 }
 
-export async function queryDatabase(cfg, appName, sql, params, opts = {}) {
-  var dbId = opts.dbId;
-  if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
+export async function queryDatabase(cfg, name, sql, params, opts = {}) {
+  if (!opts.dbId) {
+    throw new Error("dbId is required to query a CF database.");
   }
-  return queryD1(cfg.accountId, cfg.apiToken, dbId, sql, params);
+  return queryD1(cfg.accountId, cfg.apiToken, opts.dbId, sql, params);
 }
 
-export async function importDatabase(cfg, appName, sqlContent, opts = {}) {
-  var dbId = opts.dbId;
-  if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
+export async function importDatabase(cfg, name, sqlContent, opts = {}) {
+  if (!opts.dbId) {
+    throw new Error("dbId is required to import into a CF database.");
   }
+  var dbId = opts.dbId;
 
   // Step 1: Init import
   var initRes = await importD1(cfg.accountId, cfg.apiToken, dbId, {
@@ -183,15 +115,11 @@ export async function importDatabase(cfg, appName, sqlContent, opts = {}) {
   }
 }
 
-export async function exportDatabase(cfg, appName, opts = {}) {
-  var dbId = opts.dbId;
-  if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
+export async function exportDatabase(cfg, name, opts = {}) {
+  if (!opts.dbId) {
+    throw new Error("dbId is required to export a CF database.");
   }
+  var dbId = opts.dbId;
 
   var exportRes = await exportD1(cfg.accountId, cfg.apiToken, dbId, {
     output_format: "polling",
@@ -221,48 +149,22 @@ export async function exportDatabase(cfg, appName, opts = {}) {
   return dumpRes.text();
 }
 
-export async function rotateToken(cfg, appName, opts = {}) {
+export async function rotateToken(cfg, name, opts = {}) {
   var subdomain = await getWorkersSubdomain(cfg.accountId, cfg.apiToken);
   var connectionUrl = subdomain
-    ? `https://relight-${appName}.${subdomain}.workers.dev`
+    ? `https://relight-${name}.${subdomain}.workers.dev`
     : null;
 
   var dbToken = randomBytes(32).toString("hex");
 
-  if (!opts.skipAppConfig) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-
-    if (!appConfig.envKeys) appConfig.envKeys = [];
-    if (!appConfig.secretKeys) appConfig.secretKeys = [];
-    if (!appConfig.env) appConfig.env = {};
-
-    appConfig.env["DB_TOKEN"] = "[hidden]";
-    if (!appConfig.secretKeys.includes("DB_TOKEN")) appConfig.secretKeys.push("DB_TOKEN");
-    appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
-
-    if (connectionUrl) {
-      appConfig.env["DB_URL"] = connectionUrl;
-      if (!appConfig.envKeys.includes("DB_URL")) appConfig.envKeys.push("DB_URL");
-    }
-
-    await pushAppConfig(cfg, appName, appConfig, { newSecrets: { DB_TOKEN: dbToken } });
-  }
-
   return { dbToken, connectionUrl };
 }
 
-export async function resetDatabase(cfg, appName, opts = {}) {
-  var dbId = opts.dbId;
-  if (!dbId) {
-    var appConfig = await getAppConfig(cfg, appName);
-    if (!appConfig || !appConfig.dbId) {
-      throw new Error(`App ${appName} does not have a database.`);
-    }
-    dbId = appConfig.dbId;
+export async function resetDatabase(cfg, name, opts = {}) {
+  if (!opts.dbId) {
+    throw new Error("dbId is required to reset a CF database.");
   }
+  var dbId = opts.dbId;
 
   var results = await queryD1(
     cfg.accountId, cfg.apiToken, dbId,

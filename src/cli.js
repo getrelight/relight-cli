@@ -18,9 +18,10 @@ import { ps } from "./commands/ps.js";
 import { logs } from "./commands/logs.js";
 import { open } from "./commands/open.js";
 import { cost } from "./commands/cost.js";
+import { serviceList, serviceAdd, serviceRemove } from "./commands/service.js";
 import {
-  dbCreate, dbDestroy, dbInfo, dbShell, dbQuery,
-  dbImport, dbExport, dbToken, dbReset,
+  dbCreate, dbDestroy, dbList, dbInfo, dbAttach, dbDetach,
+  dbShell, dbQuery, dbImport, dbExport, dbToken, dbReset,
 } from "./commands/db.js";
 import { fmt } from "./lib/output.js";
 import { createRequire } from "module";
@@ -46,12 +47,32 @@ program
   )
   .action(auth);
 
+// --- Service ---
+
+var serviceCmd = program.command("service").description("Manage services (compute, databases, etc.)");
+
+serviceCmd
+  .command("list", { isDefault: true })
+  .description("List registered services")
+  .action(serviceList);
+
+serviceCmd
+  .command("add [name]")
+  .description("Register a service")
+  .action(serviceAdd);
+
+serviceCmd
+  .command("remove <name>")
+  .description("Remove a service")
+  .action(serviceRemove);
+
 // --- Deploy ---
 
 program
   .command("deploy [name] [path]")
   .description("Deploy an app from a Dockerfile (name auto-generated if omitted)")
   .option("-c, --cloud <cloud>", "Cloud provider (cf, gcp, aws)")
+  .option("--compute <name>", "Compute service name")
   .option("-t, --tag <tag>", "Image tag (default: deploy-<timestamp>)")
   .option("-e, --env <vars...>", "Set env vars (KEY=VALUE)")
   .option(
@@ -65,11 +86,7 @@ program
   .option("--vcpu <n>", "vCPU allocation (e.g. 0.0625, 0.5, 1, 2)", parseFloat)
   .option("--memory <mb>", "Memory in MiB (e.g. 256, 512, 1024)", parseInt)
   .option("--disk <mb>", "Disk in MB (e.g. 2000, 5000)", parseInt)
-  .option("--db", "Create and attach a D1 database")
-  .option("--db-location <hint>", "D1 location hint (wnam, enam, weur, eeur, apac)")
-  .option("--db-jurisdiction <j>", "D1 jurisdiction (eu, fedramp)")
   .option("--dns <cloud>", "Cloud provider for DNS records (cross-cloud)")
-  .option("--db-cloud <cloud>", "Cloud provider for the database (cross-cloud)")
   .option("--no-observability", "Disable Workers observability/logs")
   .option("--json", "Output result as JSON")
   .option("-y, --yes", "Skip confirmation prompt")
@@ -83,6 +100,7 @@ apps
   .command("list", { isDefault: true })
   .description("List all deployed apps")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .option("--json", "Output as JSON")
   .action(appsList);
 
@@ -90,6 +108,7 @@ apps
   .command("info [name]")
   .description("Show detailed app information")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .option("--json", "Output as JSON")
   .action(appsInfo);
 
@@ -97,6 +116,7 @@ apps
   .command("destroy [name]")
   .description("Destroy an app and its resources")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .option("--confirm <name>", "Confirm by providing the app name")
   .action(appsDestroy);
 
@@ -105,40 +125,42 @@ apps
 var configCmd = program
   .command("config")
   .description("Manage app config/env vars")
-  .option("-c, --cloud <cloud>", "Cloud provider");
+  .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name");
 
-function configCloud(cmd) {
-  return cmd?.parent?.opts()?.cloud;
+function configOpts(cmd) {
+  var parentOpts = cmd?.parent?.opts() || {};
+  return { cloud: parentOpts.cloud, compute: parentOpts.compute };
 }
 
 configCmd
   .command("show [name]", { isDefault: true })
   .description("Show all env vars for an app")
   .option("--json", "Output as JSON")
-  .action((name, options, cmd) => configShow(name, { ...options, cloud: configCloud(cmd) }));
+  .action((name, options, cmd) => configShow(name, { ...options, ...configOpts(cmd) }));
 
 configCmd
   .command("set <args...>")
   .description("Set env vars ([name] KEY=VALUE ...) - applies live")
   .option("-s, --secret", "Store values as encrypted secrets (write-only)")
-  .action((args, options, cmd) => configSet(args, { ...options, cloud: configCloud(cmd) }));
+  .action((args, options, cmd) => configSet(args, { ...options, ...configOpts(cmd) }));
 
 configCmd
   .command("get <args...>")
   .description("Get a single env var value ([name] KEY)")
-  .action((args, options, cmd) => configGet(args, { ...options, cloud: configCloud(cmd) }));
+  .action((args, options, cmd) => configGet(args, { ...options, ...configOpts(cmd) }));
 
 configCmd
   .command("unset <args...>")
   .description("Remove env vars ([name] KEY ...) - applies live")
-  .action((args, options, cmd) => configUnset(args, { ...options, cloud: configCloud(cmd) }));
+  .action((args, options, cmd) => configUnset(args, { ...options, ...configOpts(cmd) }));
 
 configCmd
   .command("import [name]")
   .description("Import env vars from .env file or stdin")
   .option("-f, --file <path>", "Path to .env file")
   .option("-s, --secret", "Store values as encrypted secrets (write-only)")
-  .action((name, options, cmd) => configImport(name, { ...options, cloud: configCloud(cmd) }));
+  .action((name, options, cmd) => configImport(name, { ...options, ...configOpts(cmd) }));
 
 // --- Scale ---
 
@@ -146,6 +168,7 @@ program
   .command("scale [name]")
   .description("Show or adjust app scaling")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .option(
     "-r, --regions <hints>",
     "Comma-separated location hints (wnam,enam,sam,weur,eeur,apac,oc,afr,me)"
@@ -164,18 +187,20 @@ var domainsCmd = program
   .command("domains")
   .description("Manage custom domains")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .option("--dns <cloud>", "Cloud provider for DNS records (cross-cloud)");
 
 domainsCmd
   .command("list [name]", { isDefault: true })
   .description("List custom domains for an app")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .option("--json", "Output as JSON")
   .action(domainsList);
 
 function domainsOpts(cmd) {
   var parentOpts = cmd?.parent?.opts() || {};
-  return { cloud: parentOpts.cloud, dns: parentOpts.dns };
+  return { cloud: parentOpts.cloud, compute: parentOpts.compute, dns: parentOpts.dns };
 }
 
 domainsCmd
@@ -188,72 +213,86 @@ domainsCmd
   .description("Remove a custom domain ([name] domain) - applies live")
   .action((args, options, cmd) => domainsRemove(args, { ...options, ...domainsOpts(cmd) }));
 
-// --- DB (topic root = info) ---
+// --- DB (topic root = list) ---
 
 var dbCmd = program
   .command("db")
-  .description("Manage app database")
-  .option("-c, --cloud <cloud>", "Cloud provider")
-  .option("--db <cloud>", "Cloud provider for the database (cross-cloud)");
-
-function dbOpts(cmd) {
-  var parentOpts = cmd?.parent?.opts() || {};
-  return { cloud: parentOpts.cloud, db: parentOpts.db };
-}
+  .description("Manage databases");
 
 dbCmd
-  .command("info [name]", { isDefault: true })
-  .description("Show database details and connection string")
+  .command("list", { isDefault: true })
+  .description("List all databases")
   .option("--json", "Output as JSON")
-  .action((name, options, cmd) => dbInfo(name, { ...options, ...dbOpts(cmd) }));
+  .action(dbList);
 
 dbCmd
-  .command("create [name]")
-  .description("Create and attach a database")
+  .command("create <name>")
+  .description("Create a standalone database")
+  .option("--provider <id>", "Provider: cf, gcp, aws, or service name (e.g. neon)")
   .option("--location <hint>", "Location hint (wnam, enam, weur, eeur, apac)")
   .option("--jurisdiction <j>", "Jurisdiction (eu, fedramp)")
   .option("--json", "Output as JSON")
-  .action((name, options, cmd) => dbCreate(name, { ...options, ...dbOpts(cmd) }));
+  .action(dbCreate);
 
 dbCmd
-  .command("destroy [name]")
-  .description("Destroy the attached database")
-  .option("--confirm <name>", "Confirm by providing the app name")
-  .action((name, options, cmd) => dbDestroy(name, { ...options, ...dbOpts(cmd) }));
+  .command("destroy <name>")
+  .description("Destroy a database")
+  .option("--confirm <name>", "Confirm by providing the database name")
+  .action(dbDestroy);
 
 dbCmd
-  .command("shell [name]")
+  .command("info <name>")
+  .description("Show database details")
+  .option("--json", "Output as JSON")
+  .action(dbInfo);
+
+dbCmd
+  .command("attach <name> [app]")
+  .description("Attach database to an app (injects env vars)")
+  .option("-c, --cloud <cloud>", "App cloud")
+  .option("--compute <name>", "App compute service")
+  .action(dbAttach);
+
+dbCmd
+  .command("detach [app]")
+  .description("Detach database from an app (removes env vars)")
+  .option("-c, --cloud <cloud>", "App cloud")
+  .option("--compute <name>", "App compute service")
+  .action(dbDetach);
+
+dbCmd
+  .command("shell <name>")
   .description("Interactive SQL REPL")
-  .action((name, options, cmd) => dbShell(name, { ...options, ...dbOpts(cmd) }));
+  .action(dbShell);
 
 dbCmd
   .command("query <args...>")
   .description("Run a single SQL query ([name] <sql>)")
   .option("--json", "Output as JSON")
-  .action((args, options, cmd) => dbQuery(args, { ...options, ...dbOpts(cmd) }));
+  .action(dbQuery);
 
 dbCmd
   .command("import <args...>")
-  .description("Import a .sql file ([name] <path>)")
-  .action((args, options, cmd) => dbImport(args, { ...options, ...dbOpts(cmd) }));
+  .description("Import a .sql file (<name> <path>)")
+  .action(dbImport);
 
 dbCmd
-  .command("export [name]")
+  .command("export <name>")
   .description("Export database as SQL dump")
   .option("-o, --output <path>", "Write to file instead of stdout")
-  .action((name, options, cmd) => dbExport(name, { ...options, ...dbOpts(cmd) }));
+  .action(dbExport);
 
 dbCmd
-  .command("token [name]")
+  .command("token <name>")
   .description("Show or rotate auth token")
   .option("--rotate", "Generate a new token")
-  .action((name, options, cmd) => dbToken(name, { ...options, ...dbOpts(cmd) }));
+  .action(dbToken);
 
 dbCmd
-  .command("reset [name]")
+  .command("reset <name>")
   .description("Drop all tables (confirmation required)")
-  .option("--confirm <name>", "Confirm by providing the app name")
-  .action((name, options, cmd) => dbReset(name, { ...options, ...dbOpts(cmd) }));
+  .option("--confirm <name>", "Confirm by providing the database name")
+  .action(dbReset);
 
 // --- PS ---
 
@@ -261,6 +300,7 @@ program
   .command("ps [name]")
   .description("Show app containers and status")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .option("--json", "Output as JSON")
   .action(ps);
 
@@ -270,6 +310,7 @@ program
   .command("logs [name]")
   .description("Stream live logs from an app")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .action(logs);
 
 // --- Open ---
@@ -278,6 +319,7 @@ program
   .command("open [name]")
   .description("Open app in browser")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .action(open);
 
 // --- Regions ---
@@ -286,11 +328,12 @@ program
   .command("regions")
   .description("List available deployment regions")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .option("--json", "Output as JSON")
   .action(async function (options) {
-    var { resolveCloudId, getCloudCfg, getProvider } = await import("./lib/providers/resolve.js");
-    var cloud = resolveCloudId(options.cloud);
-    var appProvider = await getProvider(cloud, "app");
+    var { resolveTarget } = await import("./lib/providers/resolve.js");
+    var target = await resolveTarget(options);
+    var appProvider = await target.provider("app");
 
     var regions = appProvider.getRegions();
     if (options.json) {
@@ -313,6 +356,7 @@ program
   .command("cost [name]")
   .description("Show estimated costs for an app or all apps")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .option("--since <period>", "Date range: Nd (e.g. 7d) or YYYY-MM-DD (default: month to date)")
   .option("--json", "Output as JSON")
   .action(cost);
@@ -330,6 +374,7 @@ program
   .command("destroy [name]")
   .description("Destroy an app (alias for apps destroy)")
   .option("-c, --cloud <cloud>", "Cloud provider")
+  .option("--compute <name>", "Compute service name")
   .option("--confirm <name>", "Confirm by providing the app name")
   .action(appsDestroy);
 

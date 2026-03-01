@@ -14,8 +14,14 @@ export function readLink() {
   }
 }
 
-export function linkApp(name, cloud, dns, db) {
-  var data = { app: name, cloud };
+export function linkApp(name, cloud, dns, db, compute) {
+  var data = { app: name };
+  if (compute) {
+    data.compute = compute;
+  }
+  if (cloud) {
+    data.cloud = cloud;
+  }
   if (dns && dns !== cloud) data.dns = dns;
   if (db && db !== cloud) data.db = db;
   writeFileSync(LINK_FILE, YAML.stringify(data));
@@ -52,4 +58,9 @@ export function resolveDns() {
 export function resolveDb() {
   var linked = readLink();
   return linked?.db || null;
+}
+
+export function resolveCompute() {
+  var linked = readLink();
+  return linked?.compute || null;
 }

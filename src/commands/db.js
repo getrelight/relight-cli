@@ -1,84 +1,126 @@
 import { phase, status, success, fatal, hint, fmt, table } from "../lib/output.js";
-import { resolveAppName, resolveDb, readLink, linkApp } from "../lib/link.js";
+import { resolveAppName, readLink, linkApp } from "../lib/link.js";
 import { resolveCloudId, getCloudCfg, getProvider } from "../lib/providers/resolve.js";
+import {
+  getDatabaseConfig, saveDatabaseConfig, removeDatabaseConfig, listDatabases,
+  tryGetServiceConfig, normalizeServiceConfig, CLOUD_IDS,
+} from "../lib/config.js";
 import { createInterface } from "readline";
 import { readFileSync, writeFileSync } from "fs";
 
-// Resolve app cloud and db cloud from options + .relight.yaml
-function resolveDbClouds(options) {
-  var appCloud = resolveCloudId(options.cloud);
-  var dbFlag = options.db || resolveDb();
-  var crossCloud = dbFlag && resolveCloudId(dbFlag) !== appCloud;
-  var dbCloud = crossCloud ? resolveCloudId(dbFlag) : appCloud;
-  return { appCloud, dbCloud, crossCloud };
+// --- Helpers ---
+
+function resolveDatabase(name) {
+  if (!name) {
+    var linked = readLink();
+    name = linked?.db;
+  }
+  if (!name) fatal("No database specified.");
+  var entry = getDatabaseConfig(name);
+  if (!entry) fatal(`Database '${name}' not found. Run ${fmt.cmd("relight db list")} to see databases.`);
+  return { name, entry };
 }
 
+async function loadProvider(entry) {
+  var providerId = entry.provider;
+
+  // Check if it's a service
+  var service = tryGetServiceConfig(providerId);
+  if (service && service.layer === "db") {
+    var provider = await import(`../lib/providers/${service.type}/db.js`);
+    var cfg = { ...normalizeServiceConfig(service), serviceName: providerId };
+    return { provider, cfg };
+  }
+
+  // It's a cloud
+  var provider = await getProvider(providerId, "db");
+  var cfg = getCloudCfg(providerId);
+  return { provider, cfg };
+}
+
+function resolveProvider(options) {
+  var provider = options.provider;
+  if (!provider) {
+    var linked = readLink();
+    // Try to infer from linked cloud
+    if (linked?.cloud) provider = linked.cloud;
+  }
+  if (!provider) {
+    fatal(
+      "No provider specified.",
+      `Use ${fmt.cmd("--provider <cf|gcp|aws|service-name>")} to specify the database provider.`
+    );
+  }
+  return provider;
+}
+
+// --- Commands ---
+
 export async function dbCreate(name, options) {
-  name = resolveAppName(name);
-  var { appCloud, dbCloud, crossCloud } = resolveDbClouds(options);
-  var dbCfg = getCloudCfg(dbCloud);
-  var dbProvider = await getProvider(dbCloud, "db");
+  if (!name) fatal("Database name is required.", `Usage: relight db create <name> --provider <provider>`);
+
+  // Check if already exists
+  if (getDatabaseConfig(name)) {
+    fatal(`Database '${name}' already exists.`);
+  }
+
+  var providerId = resolveProvider(options);
+
+  // Determine if this is a service or cloud
+  var service = tryGetServiceConfig(providerId);
+  var isService = service && service.layer === "db";
+  var isPostgres;
+  var provider;
+  var cfg;
+
+  if (isService) {
+    provider = await import(`../lib/providers/${service.type}/db.js`);
+    cfg = { ...normalizeServiceConfig(service), serviceName: providerId };
+    isPostgres = true;
+  } else {
+    if (!CLOUD_IDS.includes(providerId)) {
+      fatal(
+        `Unknown provider: ${providerId}`,
+        `Supported: ${CLOUD_IDS.join(", ")} or a registered db service name.`
+      );
+    }
+    provider = await getProvider(providerId, "db");
+    cfg = getCloudCfg(providerId);
+    isPostgres = providerId !== "cf";
+  }
 
   phase("Creating database");
-  if (options.jurisdiction) status(`relight-${name} (jurisdiction: ${options.jurisdiction})...`);
-  else if (options.location) status(`relight-${name} (location: ${options.location})...`);
-  else status(`relight-${name}...`);
+  if (options.jurisdiction) status(`${name} (jurisdiction: ${options.jurisdiction})...`);
+  else if (options.location) status(`${name} (location: ${options.location})...`);
+  else status(`${name}...`);
 
   var result;
   try {
-    result = await dbProvider.createDatabase(dbCfg, name, {
+    result = await provider.createDatabase(cfg, name, {
       location: options.location,
       jurisdiction: options.jurisdiction,
-      skipAppConfig: crossCloud,
     });
   } catch (e) {
     fatal(e.message);
   }
 
-  // Cross-cloud: inject DB env vars into the app cloud's config
-  if (crossCloud) {
-    var appCfg = getCloudCfg(appCloud);
-    var appProvider = await getProvider(appCloud, "app");
-    status(`Injecting DB config into ${appCloud} app...`);
-
-    var appConfig = await appProvider.getAppConfig(appCfg, name);
-    if (!appConfig) {
-      fatal(`App ${name} not found on ${appCloud}.`);
-    }
-
-    appConfig.dbId = result.dbId;
-    appConfig.dbName = result.dbName;
-
-    if (!appConfig.envKeys) appConfig.envKeys = [];
-    if (!appConfig.secretKeys) appConfig.secretKeys = [];
-    if (!appConfig.env) appConfig.env = {};
-
-    if (result.connectionUrl) {
-      // CF uses DB_URL, GCP/AWS use DATABASE_URL
-      var urlKey = dbCloud === "cf" ? "DB_URL" : "DATABASE_URL";
-      appConfig.env[urlKey] = result.connectionUrl;
-      if (!appConfig.envKeys.includes(urlKey)) appConfig.envKeys.push(urlKey);
-    }
-
-    appConfig.env["DB_TOKEN"] = "[hidden]";
-    appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
-    appConfig.secretKeys.push("DB_TOKEN");
-    appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
-
-    await appProvider.pushAppConfig(appCfg, name, appConfig, {
-      newSecrets: { DB_TOKEN: result.dbToken },
-    });
-
-    // Persist db cloud in .relight.yaml
-    var linked = readLink();
-    if (linked && !linked.db) {
-      linkApp(linked.app, linked.cloud, linked.dns, dbCloud);
-    }
-  }
+  // Save to database registry
+  saveDatabaseConfig(name, {
+    provider: providerId,
+    dbId: result.dbId,
+    dbName: result.dbName,
+    dbUser: result.dbUser || null,
+    dbToken: result.dbToken,
+    connectionUrl: result.connectionUrl,
+    isPostgres,
+    apps: [],
+    createdAt: new Date().toISOString(),
+  });
 
   if (options.json) {
     console.log(JSON.stringify({
       name,
+      provider: providerId,
       dbId: result.dbId,
       dbName: result.dbName,
       dbToken: result.dbToken,
@@ -87,22 +129,21 @@ export async function dbCreate(name, options) {
     return;
   }
 
-  success(`Database ${fmt.app(result.dbName)} created!`);
+  success(`Database ${fmt.app(name)} created!`);
+  console.log(`  ${fmt.bold("Provider:")}  ${providerId}`);
   console.log(`  ${fmt.bold("DB ID:")}     ${result.dbId}`);
   console.log(`  ${fmt.bold("DB Name:")}   ${result.dbName}`);
   if (result.connectionUrl) {
     console.log(`  ${fmt.bold("DB URL:")}    ${fmt.url(result.connectionUrl)}`);
   }
   console.log(`  ${fmt.bold("Token:")}     ${result.dbToken}`);
-  if (crossCloud) {
-    console.log(`  ${fmt.bold("DB Cloud:")}  ${fmt.cloud(dbCloud)}`);
-  }
-  hint("Next", `relight db shell ${name}`);
+  hint("Next", `relight db attach ${name} <app>`);
 }
 
 export async function dbDestroy(name, options) {
-  name = resolveAppName(name);
-  var { appCloud, dbCloud, crossCloud } = resolveDbClouds(options);
+  var resolved = resolveDatabase(name);
+  name = resolved.name;
+  var entry = resolved.entry;
 
   if (options.confirm !== name) {
     if (process.stdin.isTTY) {
@@ -122,77 +163,251 @@ export async function dbDestroy(name, options) {
     }
   }
 
+  // Auto-detach from all attached apps
+  if (entry.apps && entry.apps.length > 0) {
+    for (var appName of entry.apps) {
+      process.stderr.write(`  Detaching from ${fmt.app(appName)}...\n`);
+      try {
+        await detachFromApp(entry, appName);
+      } catch (e) {
+        process.stderr.write(`  ${fmt.dim(`Warning: could not detach from ${appName}: ${e.message}`)}\n`);
+      }
+    }
+  }
+
   phase("Destroying database");
 
-  if (crossCloud) {
-    // Read dbId from app cloud config
-    var appCfg = getCloudCfg(appCloud);
-    var appProvider = await getProvider(appCloud, "app");
-    var appConfig = await appProvider.getAppConfig(appCfg, name);
-    if (!appConfig || !appConfig.dbId) {
-      fatal(`App ${name} does not have a database.`);
-    }
-
-    var dbId = appConfig.dbId;
-    var dbCfg = getCloudCfg(dbCloud);
-    var dbProvider = await getProvider(dbCloud, "db");
-
-    // Destroy DB on db cloud
-    try {
-      await dbProvider.destroyDatabase(dbCfg, name, { dbId });
-    } catch (e) {
-      fatal(e.message);
-    }
-
-    // Clean up app config on app cloud
-    status(`Cleaning up app config on ${appCloud}...`);
-    delete appConfig.dbId;
-    delete appConfig.dbName;
-
-    if (appConfig.env) {
-      delete appConfig.env["DB_URL"];
-      delete appConfig.env["DB_TOKEN"];
-      delete appConfig.env["DATABASE_URL"];
-    }
-    if (appConfig.envKeys) appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_URL" && k !== "DATABASE_URL");
-    if (appConfig.secretKeys) appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
-
-    await appProvider.pushAppConfig(appCfg, name, appConfig);
-  } else {
-    var dbCfg = getCloudCfg(dbCloud);
-    var dbProvider = await getProvider(dbCloud, "db");
-    try {
-      await dbProvider.destroyDatabase(dbCfg, name);
-    } catch (e) {
-      fatal(e.message);
-    }
+  var { provider, cfg } = await loadProvider(entry);
+  try {
+    await provider.destroyDatabase(cfg, name, { dbId: entry.dbId });
+  } catch (e) {
+    fatal(e.message);
   }
 
-  success(`Database for ${fmt.app(name)} destroyed.`);
+  removeDatabaseConfig(name);
+  success(`Database ${fmt.app(name)} destroyed.`);
 }
 
-// In cross-cloud mode, read dbId from app cloud config
-async function getDbIdFromAppCloud(appCloud, name) {
+export async function dbList(options) {
+  var databases = listDatabases();
+
+  if (options.json) {
+    console.log(JSON.stringify(databases, null, 2));
+    return;
+  }
+
+  if (databases.length === 0) {
+    console.log(fmt.dim("\n  No databases. Create one with: relight db create <name> --provider <provider>\n"));
+    return;
+  }
+
+  var cols = ["NAME", "PROVIDER", "DB NAME", "APPS", "CREATED"];
+  var rows = databases.map((db) => [
+    db.name,
+    db.provider,
+    db.dbName || "-",
+    (db.apps || []).join(", ") || "-",
+    db.createdAt ? db.createdAt.split("T")[0] : "-",
+  ]);
+
+  console.log(table(cols, rows));
+}
+
+export async function dbAttach(name, appName, options) {
+  var resolved = resolveDatabase(name);
+  name = resolved.name;
+  var entry = resolved.entry;
+
+  appName = resolveAppName(appName);
+
+  // Check not already attached
+  if (entry.apps && entry.apps.includes(appName)) {
+    fatal(`Database '${name}' is already attached to '${appName}'.`);
+  }
+
+  // Resolve app's cloud/compute
+  var appCloud = resolveCloudId(options.cloud);
   var appCfg = getCloudCfg(appCloud);
   var appProvider = await getProvider(appCloud, "app");
-  var appConfig = await appProvider.getAppConfig(appCfg, name);
-  if (!appConfig || !appConfig.dbId) {
-    throw new Error(`App ${name} does not have a database.`);
+
+  // Check if compute service
+  if (options.compute) {
+    var computeService = tryGetServiceConfig(options.compute);
+    if (computeService) {
+      appProvider = await import(`../lib/providers/${computeService.type}/app.js`);
+      appCfg = normalizeServiceConfig(computeService);
+    }
   }
-  return appConfig.dbId;
+
+  phase("Attaching database");
+  status(`${name} -> ${appName}...`);
+
+  var appConfig = await appProvider.getAppConfig(appCfg, appName);
+  if (!appConfig) {
+    fatal(`App ${appName} not found.`);
+  }
+
+  if (!appConfig.envKeys) appConfig.envKeys = [];
+  if (!appConfig.secretKeys) appConfig.secretKeys = [];
+  if (!appConfig.env) appConfig.env = {};
+
+  // Inject env vars
+  if (entry.isPostgres) {
+    if (entry.connectionUrl) {
+      appConfig.env["DATABASE_URL"] = entry.connectionUrl;
+      if (!appConfig.envKeys.includes("DATABASE_URL")) appConfig.envKeys.push("DATABASE_URL");
+    }
+  } else {
+    // CF D1
+    appConfig.dbId = entry.dbId;
+    appConfig.dbName = entry.dbName;
+    if (entry.connectionUrl) {
+      appConfig.env["DB_URL"] = entry.connectionUrl;
+      if (!appConfig.envKeys.includes("DB_URL")) appConfig.envKeys.push("DB_URL");
+    }
+  }
+
+  appConfig.env["DB_TOKEN"] = "[hidden]";
+  appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
+  appConfig.secretKeys.push("DB_TOKEN");
+  appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
+
+  if (entry.dbUser) appConfig.dbUser = entry.dbUser;
+
+  await appProvider.pushAppConfig(appCfg, appName, appConfig, {
+    newSecrets: { DB_TOKEN: entry.dbToken },
+  });
+
+  // Update registry: add app to entry.apps
+  if (!entry.apps) entry.apps = [];
+  entry.apps.push(appName);
+  saveDatabaseConfig(name, entry);
+
+  // Update .relight.yaml: set db to database name
+  var linked = readLink();
+  if (linked && linked.app === appName) {
+    linkApp(linked.app, linked.cloud, linked.dns, name, linked.compute);
+  }
+
+  success(`Database ${fmt.app(name)} attached to ${fmt.app(appName)}.`);
+}
+
+// Helper to detach a database from an app (used by dbDetach and dbDestroy)
+async function detachFromApp(entry, appName, options = {}) {
+  var appCloud = options.cloud ? resolveCloudId(options.cloud) : null;
+  if (!appCloud) {
+    var linked = readLink();
+    appCloud = linked?.cloud;
+  }
+  if (!appCloud) {
+    // Try to infer from entry.provider if it's a cloud
+    if (CLOUD_IDS.includes(entry.provider)) {
+      appCloud = entry.provider;
+    }
+  }
+  if (!appCloud) {
+    throw new Error("Cannot determine app cloud. Use --cloud to specify.");
+  }
+
+  var appCfg = getCloudCfg(appCloud);
+  var appProvider = await getProvider(appCloud, "app");
+
+  if (options.compute) {
+    var computeService = tryGetServiceConfig(options.compute);
+    if (computeService) {
+      appProvider = await import(`../lib/providers/${computeService.type}/app.js`);
+      appCfg = normalizeServiceConfig(computeService);
+    }
+  }
+
+  var appConfig = await appProvider.getAppConfig(appCfg, appName);
+  if (!appConfig) return;
+
+  // Remove DB env vars
+  delete appConfig.dbId;
+  delete appConfig.dbName;
+  delete appConfig.dbUser;
+
+  if (appConfig.env) {
+    delete appConfig.env["DB_URL"];
+    delete appConfig.env["DB_TOKEN"];
+    delete appConfig.env["DATABASE_URL"];
+  }
+  if (appConfig.envKeys) {
+    appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_URL" && k !== "DATABASE_URL");
+  }
+  if (appConfig.secretKeys) {
+    appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
+  }
+
+  await appProvider.pushAppConfig(appCfg, appName, appConfig);
+}
+
+export async function dbDetach(appName, options) {
+  appName = resolveAppName(appName);
+
+  // Find which database is attached to this app
+  var databases = listDatabases();
+  var attached = null;
+  var attachedName = null;
+
+  // Check .relight.yaml first
+  var linked = readLink();
+  if (linked?.db) {
+    var entry = getDatabaseConfig(linked.db);
+    if (entry && entry.apps && entry.apps.includes(appName)) {
+      attached = entry;
+      attachedName = linked.db;
+    }
+  }
+
+  // Search registry
+  if (!attached) {
+    for (var db of databases) {
+      if (db.apps && db.apps.includes(appName)) {
+        attached = db;
+        attachedName = db.name;
+        break;
+      }
+    }
+  }
+
+  if (!attached) {
+    fatal(`No database found attached to '${appName}'.`);
+  }
+
+  phase("Detaching database");
+  status(`${attachedName} from ${appName}...`);
+
+  try {
+    await detachFromApp(attached, appName, options);
+  } catch (e) {
+    fatal(e.message);
+  }
+
+  // Update registry: remove app from entry.apps
+  attached.apps = (attached.apps || []).filter((a) => a !== appName);
+  // Remove extra fields added by listDatabases() (like 'name')
+  var cleanEntry = getDatabaseConfig(attachedName);
+  cleanEntry.apps = attached.apps;
+  saveDatabaseConfig(attachedName, cleanEntry);
+
+  success(`Database ${fmt.app(attachedName)} detached from ${fmt.app(appName)}.`);
 }
 
 export async function dbInfo(name, options) {
-  name = resolveAppName(name);
-  var { appCloud, dbCloud, crossCloud } = resolveDbClouds(options);
-  var dbCfg = getCloudCfg(dbCloud);
-  var dbProvider = await getProvider(dbCloud, "db");
+  var resolved = resolveDatabase(name);
+  name = resolved.name;
+  var entry = resolved.entry;
 
-  var dbId = crossCloud ? await getDbIdFromAppCloud(appCloud, name) : undefined;
+  var { provider, cfg } = await loadProvider(entry);
 
   var info;
   try {
-    info = await dbProvider.getDatabaseInfo(dbCfg, name, { dbId });
+    info = await provider.getDatabaseInfo(cfg, name, {
+      dbId: entry.dbId,
+      connectionUrl: entry.connectionUrl,
+    });
   } catch (e) {
     fatal(e.message);
   }
@@ -200,19 +415,23 @@ export async function dbInfo(name, options) {
   if (options.json) {
     console.log(JSON.stringify({
       name,
+      provider: entry.provider,
       dbId: info.dbId,
       dbName: info.dbName,
       connectionUrl: info.connectionUrl,
       size: info.size,
       numTables: info.numTables,
-      createdAt: info.createdAt,
+      apps: entry.apps || [],
+      createdAt: info.createdAt || entry.createdAt,
     }, null, 2));
     return;
   }
 
   console.log("");
-  console.log(`${fmt.bold("Database:")}   ${fmt.app(info.dbName)}`);
+  console.log(`${fmt.bold("Database:")}   ${fmt.app(name)}`);
+  console.log(`${fmt.bold("Provider:")}   ${entry.provider}`);
   console.log(`${fmt.bold("DB ID:")}      ${info.dbId}`);
+  console.log(`${fmt.bold("DB Name:")}    ${info.dbName}`);
   if (info.size != null) {
     var sizeKb = (info.size / 1024).toFixed(1);
     console.log(`${fmt.bold("Size:")}       ${sizeKb} KB`);
@@ -224,26 +443,33 @@ export async function dbInfo(name, options) {
     console.log(`${fmt.bold("DB URL:")}     ${fmt.url(info.connectionUrl)}`);
   }
   console.log(`${fmt.bold("Token:")}      ${fmt.dim("[hidden]")}`);
-  if (info.createdAt) {
-    console.log(`${fmt.bold("Created:")}    ${info.createdAt}`);
+  if (entry.apps && entry.apps.length > 0) {
+    console.log(`${fmt.bold("Apps:")}       ${entry.apps.join(", ")}`);
+  }
+  if (info.createdAt || entry.createdAt) {
+    console.log(`${fmt.bold("Created:")}    ${info.createdAt || entry.createdAt}`);
   }
   console.log("");
 }
 
 export async function dbShell(name, options) {
-  name = resolveAppName(name);
-  var { appCloud, dbCloud, crossCloud } = resolveDbClouds(options);
-  var dbCfg = getCloudCfg(dbCloud);
-  var dbProvider = await getProvider(dbCloud, "db");
+  var resolved = resolveDatabase(name);
+  name = resolved.name;
+  var entry = resolved.entry;
 
-  var dbId = crossCloud ? await getDbIdFromAppCloud(appCloud, name) : undefined;
+  var { provider, cfg } = await loadProvider(entry);
 
   // Verify database exists
   try {
-    await dbProvider.getDatabaseInfo(dbCfg, name, { dbId });
+    await provider.getDatabaseInfo(cfg, name, {
+      dbId: entry.dbId,
+      connectionUrl: entry.connectionUrl,
+    });
   } catch (e) {
     fatal(e.message);
   }
+
+  var isPostgres = entry.isPostgres;
 
   var rl = createInterface({
     input: process.stdin,
@@ -251,7 +477,7 @@ export async function dbShell(name, options) {
     prompt: "sql> ",
   });
 
-  process.stderr.write(`Connected to ${fmt.app(`relight-${name}`)}. Type .exit to quit.\n\n`);
+  process.stderr.write(`Connected to ${fmt.app(name)}. Type .exit to quit.\n\n`);
   rl.prompt();
 
   rl.on("line", async (line) => {
@@ -269,7 +495,7 @@ export async function dbShell(name, options) {
     try {
       var sql;
       if (line === ".tables") {
-        if (dbCloud === "gcp" || dbCloud === "aws") {
+        if (isPostgres) {
           sql = "SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename";
         } else {
           sql = "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY name";
@@ -281,7 +507,7 @@ export async function dbShell(name, options) {
           rl.prompt();
           return;
         }
-        if (dbCloud === "gcp" || dbCloud === "aws") {
+        if (isPostgres) {
           sql = `SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '${tableName}' AND table_schema = 'public' ORDER BY ordinal_position`;
         } else {
           sql = `SELECT sql FROM sqlite_master WHERE name='${tableName}'`;
@@ -290,7 +516,10 @@ export async function dbShell(name, options) {
         sql = line;
       }
 
-      var results = await dbProvider.queryDatabase(dbCfg, name, sql, undefined, { dbId });
+      var results = await provider.queryDatabase(cfg, name, sql, undefined, {
+        dbId: entry.dbId,
+        connectionUrl: entry.connectionUrl,
+      });
       var result = Array.isArray(results) ? results[0] : results;
 
       if (result && result.results && result.results.length > 0) {
@@ -329,16 +558,18 @@ export async function dbQuery(args, options) {
     sql = joined;
   }
 
-  name = resolveAppName(name);
-  var { appCloud, dbCloud, crossCloud } = resolveDbClouds(options);
-  var dbCfg = getCloudCfg(dbCloud);
-  var dbProvider = await getProvider(dbCloud, "db");
+  var resolved = resolveDatabase(name);
+  name = resolved.name;
+  var entry = resolved.entry;
 
-  var dbId = crossCloud ? await getDbIdFromAppCloud(appCloud, name) : undefined;
+  var { provider, cfg } = await loadProvider(entry);
 
   var results;
   try {
-    results = await dbProvider.queryDatabase(dbCfg, name, sql, undefined, { dbId });
+    results = await provider.queryDatabase(cfg, name, sql, undefined, {
+      dbId: entry.dbId,
+      connectionUrl: entry.connectionUrl,
+    });
   } catch (e) {
     fatal(e.message);
   }
@@ -369,15 +600,14 @@ export async function dbImport(args, options) {
   } else if (args.length === 1) {
     filepath = args[0];
   } else {
-    fatal("Usage: relight db import [name] <path>");
+    fatal("Usage: relight db import <name> <path>");
   }
 
-  name = resolveAppName(name);
-  var { appCloud, dbCloud, crossCloud } = resolveDbClouds(options);
-  var dbCfg = getCloudCfg(dbCloud);
-  var dbProvider = await getProvider(dbCloud, "db");
+  var resolved = resolveDatabase(name);
+  name = resolved.name;
+  var entry = resolved.entry;
 
-  var dbId = crossCloud ? await getDbIdFromAppCloud(appCloud, name) : undefined;
+  var { provider, cfg } = await loadProvider(entry);
 
   var sqlContent;
   try {
@@ -390,28 +620,33 @@ export async function dbImport(args, options) {
   status(`File: ${filepath} (${(sqlContent.length / 1024).toFixed(1)} KB)`);
 
   try {
-    await dbProvider.importDatabase(dbCfg, name, sqlContent, { dbId });
+    await provider.importDatabase(cfg, name, sqlContent, {
+      dbId: entry.dbId,
+      connectionUrl: entry.connectionUrl,
+    });
   } catch (e) {
     fatal(e.message);
   }
 
-  success(`Imported ${filepath} into ${fmt.app(`relight-${name}`)}`);
+  success(`Imported ${filepath} into ${fmt.app(name)}`);
 }
 
 export async function dbExport(name, options) {
-  name = resolveAppName(name);
-  var { appCloud, dbCloud, crossCloud } = resolveDbClouds(options);
-  var dbCfg = getCloudCfg(dbCloud);
-  var dbProvider = await getProvider(dbCloud, "db");
+  var resolved = resolveDatabase(name);
+  name = resolved.name;
+  var entry = resolved.entry;
 
-  var dbId = crossCloud ? await getDbIdFromAppCloud(appCloud, name) : undefined;
+  var { provider, cfg } = await loadProvider(entry);
 
   phase("Exporting database");
   status("Initiating export...");
 
   var dump;
   try {
-    dump = await dbProvider.exportDatabase(dbCfg, name, { dbId });
+    dump = await provider.exportDatabase(cfg, name, {
+      dbId: entry.dbId,
+      connectionUrl: entry.connectionUrl,
+    });
   } catch (e) {
     fatal(e.message);
   }
@@ -425,47 +660,59 @@ export async function dbExport(name, options) {
 }
 
 export async function dbToken(name, options) {
-  name = resolveAppName(name);
-  var { appCloud, dbCloud, crossCloud } = resolveDbClouds(options);
-  var dbCfg = getCloudCfg(dbCloud);
-  var dbProvider = await getProvider(dbCloud, "db");
+  var resolved = resolveDatabase(name);
+  name = resolved.name;
+  var entry = resolved.entry;
 
   if (options.rotate) {
-    var dbId = crossCloud ? await getDbIdFromAppCloud(appCloud, name) : undefined;
+    var { provider, cfg } = await loadProvider(entry);
 
     var result;
     try {
-      result = await dbProvider.rotateToken(dbCfg, name, {
-        dbId,
-        skipAppConfig: crossCloud,
-      });
+      result = await provider.rotateToken(cfg, name, { dbId: entry.dbId });
     } catch (e) {
       fatal(e.message);
     }
 
-    // Cross-cloud: update env vars on app cloud
-    if (crossCloud) {
-      var appCfg = getCloudCfg(appCloud);
-      var appProvider = await getProvider(appCloud, "app");
-      var appConfig = await appProvider.getAppConfig(appCfg, name);
+    // Update registry with new token and connection URL
+    entry.dbToken = result.dbToken;
+    if (result.connectionUrl) entry.connectionUrl = result.connectionUrl;
+    saveDatabaseConfig(name, entry);
 
-      if (!appConfig.envKeys) appConfig.envKeys = [];
-      if (!appConfig.secretKeys) appConfig.secretKeys = [];
-      if (!appConfig.env) appConfig.env = {};
+    // Update all attached apps
+    if (entry.apps && entry.apps.length > 0) {
+      for (var appName of entry.apps) {
+        status(`Updating ${appName}...`);
+        try {
+          // Re-attach to update the token in the app
+          var appCloud = resolveCloudId(null);
+          var appCfg = getCloudCfg(appCloud);
+          var appProvider = await getProvider(appCloud, "app");
+          var appConfig = await appProvider.getAppConfig(appCfg, appName);
 
-      appConfig.env["DB_TOKEN"] = "[hidden]";
-      if (!appConfig.secretKeys.includes("DB_TOKEN")) appConfig.secretKeys.push("DB_TOKEN");
-      appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
+          if (appConfig) {
+            if (!appConfig.envKeys) appConfig.envKeys = [];
+            if (!appConfig.secretKeys) appConfig.secretKeys = [];
+            if (!appConfig.env) appConfig.env = {};
 
-      if (result.connectionUrl) {
-        var urlKey = dbCloud === "cf" ? "DB_URL" : "DATABASE_URL";
-        appConfig.env[urlKey] = result.connectionUrl;
-        if (!appConfig.envKeys.includes(urlKey)) appConfig.envKeys.push(urlKey);
+            appConfig.env["DB_TOKEN"] = "[hidden]";
+            if (!appConfig.secretKeys.includes("DB_TOKEN")) appConfig.secretKeys.push("DB_TOKEN");
+            appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
+
+            if (result.connectionUrl) {
+              var urlKey = entry.isPostgres ? "DATABASE_URL" : "DB_URL";
+              appConfig.env[urlKey] = result.connectionUrl;
+              if (!appConfig.envKeys.includes(urlKey)) appConfig.envKeys.push(urlKey);
+            }
+
+            await appProvider.pushAppConfig(appCfg, appName, appConfig, {
+              newSecrets: { DB_TOKEN: result.dbToken },
+            });
+          }
+        } catch (e) {
+          process.stderr.write(`  ${fmt.dim(`Warning: could not update ${appName}: ${e.message}`)}\n`);
+        }
       }
-
-      await appProvider.pushAppConfig(appCfg, name, appConfig, {
-        newSecrets: { DB_TOKEN: result.dbToken },
-      });
     }
 
     success("Token rotated.");
@@ -475,22 +722,16 @@ export async function dbToken(name, options) {
     }
   } else {
     console.log(`${fmt.bold("Token:")}    ${fmt.dim("[hidden] - use --rotate to generate a new token")}`);
-    // Try to show connection URL
-    try {
-      var dbId = crossCloud ? await getDbIdFromAppCloud(appCloud, name) : undefined;
-      var info = await dbProvider.getDatabaseInfo(dbCfg, name, { dbId });
-      if (info.connectionUrl) {
-        console.log(`${fmt.bold("DB URL:")}   ${fmt.url(info.connectionUrl)}`);
-      }
-    } catch {}
+    if (entry.connectionUrl) {
+      console.log(`${fmt.bold("DB URL:")}   ${fmt.url(entry.connectionUrl)}`);
+    }
   }
 }
 
 export async function dbReset(name, options) {
-  name = resolveAppName(name);
-  var { appCloud, dbCloud, crossCloud } = resolveDbClouds(options);
-  var dbCfg = getCloudCfg(dbCloud);
-  var dbProvider = await getProvider(dbCloud, "db");
+  var resolved = resolveDatabase(name);
+  name = resolved.name;
+  var entry = resolved.entry;
 
   if (options.confirm !== name) {
     if (process.stdin.isTTY) {
@@ -510,14 +751,17 @@ export async function dbReset(name, options) {
     }
   }
 
-  var dbId = crossCloud ? await getDbIdFromAppCloud(appCloud, name) : undefined;
+  var { provider, cfg } = await loadProvider(entry);
 
   phase("Resetting database");
   status("Listing tables...");
 
   var tables;
   try {
-    tables = await dbProvider.resetDatabase(dbCfg, name, { dbId });
+    tables = await provider.resetDatabase(cfg, name, {
+      dbId: entry.dbId,
+      connectionUrl: entry.connectionUrl,
+    });
   } catch (e) {
     fatal(e.message);
   }

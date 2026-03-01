@@ -1,12 +1,12 @@
 import { success, fatal, hint, fmt, table } from "../lib/output.js";
 import { resolveAppName, readLink, unlinkApp } from "../lib/link.js";
-import { resolveCloudId, getCloudCfg, getProvider } from "../lib/providers/resolve.js";
+import { resolveTarget } from "../lib/providers/resolve.js";
 import { createInterface } from "readline";
 
 export async function appsList(options) {
-  var cloud = resolveCloudId(options.cloud);
-  var cfg = getCloudCfg(cloud);
-  var appProvider = await getProvider(cloud, "app");
+  var target = await resolveTarget(options);
+  var cfg = target.cfg;
+  var appProvider = await target.provider("app");
 
   var apps = await appProvider.listApps(cfg);
 
@@ -35,9 +35,9 @@ export async function appsList(options) {
 
 export async function appsInfo(name, options) {
   name = resolveAppName(name);
-  var cloud = resolveCloudId(options.cloud);
-  var cfg = getCloudCfg(cloud);
-  var appProvider = await getProvider(cloud, "app");
+  var target = await resolveTarget(options);
+  var cfg = target.cfg;
+  var appProvider = await target.provider("app");
 
   var info = await appProvider.getAppInfo(cfg, name);
 
@@ -88,9 +88,9 @@ export async function appsInfo(name, options) {
 
 export async function appsDestroy(name, options) {
   name = resolveAppName(name);
-  var cloud = resolveCloudId(options.cloud);
-  var cfg = getCloudCfg(cloud);
-  var appProvider = await getProvider(cloud, "app");
+  var target = await resolveTarget(options);
+  var cfg = target.cfg;
+  var appProvider = await target.provider("app");
 
   if (options.confirm !== name) {
     if (process.stdin.isTTY) {

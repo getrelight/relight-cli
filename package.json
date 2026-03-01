@@ -1,7 +1,7 @@
 {
   "name": "relight-cli",
-  "version": "0.1.0",
-  "description": "Deploy and manage Docker containers across clouds with scale-to-zero",
+  "version": "0.2.0",
+  "description": "Deploy web apps across clouds with scale-to-zero",
   "bin": {
     "relight": "./src/cli.js"
   },

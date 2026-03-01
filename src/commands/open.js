@@ -2,13 +2,13 @@ import { execSync } from "child_process";
 import { platform } from "os";
 import { fatal, fmt } from "../lib/output.js";
 import { resolveAppName } from "../lib/link.js";
-import { resolveCloudId, getCloudCfg, getProvider } from "../lib/providers/resolve.js";
+import { resolveTarget } from "../lib/providers/resolve.js";
 
 export async function open(name, options) {
   name = resolveAppName(name);
-  var cloud = resolveCloudId(options.cloud);
-  var cfg = getCloudCfg(cloud);
-  var appProvider = await getProvider(cloud, "app");
+  var target = await resolveTarget(options);
+  var cfg = target.cfg;
+  var appProvider = await target.provider("app");
 
   var url = await appProvider.getAppUrl(cfg, name);
 

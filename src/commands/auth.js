@@ -16,7 +16,6 @@ import {
   verifyProject,
 } from "../lib/clouds/gcp.js";
 import { verifyCredentials as awsVerify } from "../lib/clouds/aws.js";
-import { verifyConnection as slicerVerify } from "../lib/clouds/slicervm.js";
 import kleur from "kleur";
 
 function prompt(rl, question) {
@@ -73,9 +72,6 @@ export async function auth(options) {
     case "aws":
       cloudConfig = await authAWS(rl);
       break;
-    case "slicervm":
-      cloudConfig = await authSlicerVM(rl);
-      break;
   }
 
   rl.close();
@@ -109,8 +105,6 @@ function normalizeCompute(input) {
     aws: "aws",
     amazon: "aws",
     "app-runner": "aws",
-    slicervm: "slicervm",
-    slicer: "slicervm",
   };
   return aliases[input.toLowerCase()] || input.toLowerCase();
 }
@@ -300,62 +294,6 @@ async function authAWS(rl) {
   process.stderr.write(`  Region: ${fmt.bold(region)}\n`);
 
   return { accessKeyId, secretAccessKey, region };
-}
-
-// --- SlicerVM ---
-
-async function authSlicerVM(rl) {
-  process.stderr.write(`\n  ${kleur.bold("Connection mode")}\n\n`);
-  process.stderr.write(`  ${kleur.bold("[1]")} Unix socket (local dev)\n`);
-  process.stderr.write(`  ${kleur.bold("[2]")} HTTP API (remote)\n\n`);
-
-  var modeChoice = await prompt(rl, "Select [1-2]: ");
-  var useSocket = modeChoice.trim() === "1";
-
-  var config = {};
-
-  if (useSocket) {
-    var defaultSocket = "/var/run/slicer/slicer.sock";
-    var socketPath = await prompt(rl, `Socket path [${defaultSocket}]: `);
-    socketPath = (socketPath || "").trim() || defaultSocket;
-    config.socketPath = socketPath;
-  } else {
-    var apiUrl = await prompt(rl, "Slicer API URL (e.g. https://slicer.example.com:8080): ");
-    apiUrl = (apiUrl || "").trim().replace(/\/+$/, "");
-    if (!apiUrl) fatal("No API URL provided.");
-    config.apiUrl = apiUrl;
-
-    var token = await prompt(rl, "API token: ");
-    token = (token || "").trim();
-    if (!token) fatal("No token provided.");
-    config.token = token;
-  }
-
-  var hostGroup = await prompt(rl, "Host group [apps]: ");
-  config.hostGroup = (hostGroup || "").trim() || "apps";
-
-  var baseDomain = await prompt(rl, "Base domain (e.g. apps.example.com) [localhost]: ");
-  config.baseDomain = (baseDomain || "").trim() || "localhost";
-
-  process.stderr.write("\nVerifying...\n");
-  var verifyCfg = useSocket
-    ? { socketPath: config.socketPath }
-    : { apiUrl: config.apiUrl, apiToken: config.token };
-  try {
-    await slicerVerify(verifyCfg);
-  } catch (e) {
-    fatal("Connection failed.", e.message);
-  }
-
-  if (useSocket) {
-    process.stderr.write(`  Socket: ${fmt.bold(config.socketPath)}\n`);
-  } else {
-    process.stderr.write(`  API: ${fmt.bold(config.apiUrl)}\n`);
-  }
-  process.stderr.write(`  Host group: ${fmt.dim(config.hostGroup)}\n`);
-  process.stderr.write(`  Base domain: ${fmt.dim(config.baseDomain)}\n`);
-
-  return config;
 }
 
 // --- Helpers ---
