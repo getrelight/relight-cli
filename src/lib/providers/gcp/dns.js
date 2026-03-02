@@ -4,7 +4,7 @@ import {
   createDnsChange,
   listResourceRecordSets,
 } from "../../clouds/gcp.js";
-import { getAppConfig, pushAppConfig, getAppUrl } from "./app.js";
+import { getAppConfig, pushAppConfig, getAppUrl, mapCustomDomain as mapDomain, unmapCustomDomain as unmapDomain } from "./app.js";
 
 export async function getZones(cfg) {
   var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
@@ -47,10 +47,9 @@ export async function listDomains(cfg, appName) {
 export async function addDomain(cfg, appName, domain, { zone }) {
   var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
 
-  // Get Cloud Run URL to use as CNAME target
-  var url = await getAppUrl(cfg, appName);
-  if (!url) throw new Error("Could not determine app URL for CNAME target.");
-  var target = new URL(url).hostname;
+  // Set up Firebase Hosting and get CNAME target
+  var mapping = await mapDomain(cfg, appName, domain);
+  var target = mapping.dnsTarget;
 
   // FQDN for Cloud DNS (trailing dot)
   var fqdn = domain.endsWith(".") ? domain : domain + ".";
@@ -67,7 +66,7 @@ export async function addDomain(cfg, appName, domain, { zone }) {
     );
   }
 
-  // Create CNAME record
+  // Create CNAME record pointing to Firebase Hosting
   await createDnsChange(token, cfg.project, zone.id, {
     additions: [
       {
@@ -111,6 +110,9 @@ export async function removeDomain(cfg, appName, domain) {
     }
   }
 
+  // Remove Firebase Hosting custom domain
+  await unmapDomain(cfg, appName, domain);
+
   // Update app config
   var appConfig = await getAppConfig(cfg, appName);
   if (appConfig) {
@@ -121,7 +123,7 @@ export async function removeDomain(cfg, appName, domain) {
 
 // --- Pure DNS record operations (for cross-cloud use) ---
 
-export async function addDnsRecord(cfg, domain, target, zone) {
+export async function addDnsRecord(cfg, domain, target, zone, opts = {}) {
   var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
   var fqdn = domain.endsWith(".") ? domain : domain + ".";
   var targetFqdn = target.endsWith(".") ? target : target + ".";

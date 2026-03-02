@@ -84,6 +84,9 @@ export async function appsInfo(name, options) {
   if (appConfig.createdAt) {
     console.log(`${fmt.bold("Created:")}    ${appConfig.createdAt}`);
   }
+  if (info.consoleUrl) {
+    console.log(`${fmt.bold("Console:")}    ${fmt.url(info.consoleUrl)}`);
+  }
 }
 
 export async function appsDestroy(name, options) {

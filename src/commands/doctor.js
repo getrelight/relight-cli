@@ -9,7 +9,7 @@ import {
   normalizeServiceConfig,
 } from "../lib/config.js";
 import { verifyToken as cfVerify, getWorkersSubdomain } from "../lib/clouds/cf.js";
-import { mintAccessToken, verifyProject as gcpVerifyProject, listRegions as gcpListRegions, gcpApi, AR_API, SQLADMIN_API, DNS_API } from "../lib/clouds/gcp.js";
+import { mintAccessToken, verifyProject as gcpVerifyProject, listAllServices as gcpListServices, gcpApi, AR_API, SQLADMIN_API, DNS_API } from "../lib/clouds/gcp.js";
 import { verifyCredentials as awsVerify, checkAppRunner, awsJsonApi, awsQueryApi, awsRestXmlApi } from "../lib/clouds/aws.js";
 import { verifyConnection as slicerVerify } from "../lib/clouds/slicervm.js";
 import kleur from "kleur";
@@ -156,7 +156,7 @@ async function checkGCP(cfg) {
 
     ok =
       (await asyncCheck("Cloud Run API reachable", async () => {
-        await gcpListRegions(token, cfg.project);
+        await gcpListServices(token, cfg.project);
       })) && ok;
 
     ok =

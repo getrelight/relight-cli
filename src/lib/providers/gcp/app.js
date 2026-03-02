@@ -9,6 +9,13 @@ import {
   listLogEntries,
   queryTimeSeries,
   deleteSqlInstance,
+  ensureFirebaseProject,
+  createHostingSite,
+  getHostingSite,
+  deleteHostingSite,
+  deployHostingProxy,
+  addHostingCustomDomain,
+  deleteHostingCustomDomain,
 } from "../../clouds/gcp.js";
 
 // --- Helpers ---
@@ -199,8 +206,14 @@ export async function getAppInfo(cfg, appName) {
   var svc = await findService(token, cfg.project, appName);
   if (!svc) return null;
 
+  var region = parseRegionFromName(svc.name);
+  var svcId = svc.name.split("/").pop();
   var appConfig = await getAppConfig(cfg, appName);
-  return { appConfig, url: svc.uri || null };
+  return {
+    appConfig,
+    url: svc.uri || null,
+    consoleUrl: `https://console.cloud.google.com/run/detail/${region}/${svcId}?project=${cfg.project}`,
+  };
 }
 
 // --- Destroy ---
@@ -215,6 +228,11 @@ export async function destroyApp(cfg, appName) {
       await deleteSqlInstance(token, cfg.project, appConfig.dbId);
     } catch {}
   }
+
+  // Delete Firebase Hosting site if exists
+  try {
+    await deleteHostingSite(token, cfg.project, hostingSiteId(appName));
+  } catch {}
 
   // Delete Cloud Run service
   var svc = await findService(token, cfg.project, appName);
@@ -275,6 +293,48 @@ export async function getAppUrl(cfg, appName) {
   return svc?.uri || null;
 }
 
+// --- Custom domain via Firebase Hosting ---
+
+function hostingSiteId(appName) {
+  return `relight-${appName}`;
+}
+
+async function ensureHostingSite(token, project, appName) {
+  var siteId = hostingSiteId(appName);
+  try {
+    await getHostingSite(token, project, siteId);
+  } catch {
+    await ensureFirebaseProject(token, project);
+    await createHostingSite(token, project, siteId);
+  }
+
+  // Deploy proxy config pointing to Cloud Run
+  var svc = await findService(token, project, appName);
+  if (!svc) throw new Error(`Service relight-${appName} not found.`);
+  var region = parseRegionFromName(svc.name);
+  var svcId = svc.name.split("/").pop();
+  await deployHostingProxy(token, siteId, svcId, region);
+
+  return siteId;
+}
+
+export async function mapCustomDomain(cfg, appName, domain) {
+  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
+  var siteId = await ensureHostingSite(token, cfg.project, appName);
+  await addHostingCustomDomain(token, cfg.project, siteId, domain);
+  return { dnsTarget: `${siteId}.web.app`, proxied: false };
+}
+
+export async function unmapCustomDomain(cfg, appName, domain) {
+  var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
+  var siteId = hostingSiteId(appName);
+  try {
+    await deleteHostingCustomDomain(token, cfg.project, siteId, domain);
+  } catch (e) {
+    if (!e.message.includes("404")) throw e;
+  }
+}
+
 // --- Log streaming ---
 
 export async function streamLogs(cfg, appName) {
@@ -328,6 +388,10 @@ export async function getCosts(cfg, appNames, dateRange) {
   var token = await mintAccessToken(cfg.clientEmail, cfg.privateKey);
   var { sinceISO, untilISO } = dateRange;
 
+  // MQL datetime format: YYYY/MM/DD-HH:MM:SS (not ISO 8601)
+  var sinceMql = isoToMql(sinceISO);
+  var untilMql = isoToMql(untilISO);
+
   // Discover apps
   var apps;
   if (appNames) {
@@ -353,7 +417,7 @@ export async function getCosts(cfg, appNames, dateRange) {
         query: `fetch cloud_run_revision
           | metric 'run.googleapis.com/request_count'
           | filter resource.service_name == '${app.serviceName}'
-          | within d'${sinceISO}', d'${untilISO}'
+          | within d'${sinceMql}', d'${untilMql}'
           | group_by [], sum(val())`,
       });
       var reqData = reqRes.timeSeriesData || [];
@@ -362,7 +426,9 @@ export async function getCosts(cfg, appNames, dateRange) {
           usage.requests += Number(pt.values?.[0]?.int64Value || 0);
         }
       }
-    } catch {}
+    } catch (e) {
+      process.stderr.write(`  Warning: failed to fetch request metrics: ${e.message}\n`);
+    }
 
     try {
       // CPU allocation
@@ -370,7 +436,7 @@ export async function getCosts(cfg, appNames, dateRange) {
         query: `fetch cloud_run_revision
           | metric 'run.googleapis.com/container/cpu/allocation_time'
           | filter resource.service_name == '${app.serviceName}'
-          | within d'${sinceISO}', d'${untilISO}'
+          | within d'${sinceMql}', d'${untilMql}'
           | group_by [], sum(val())`,
       });
       var cpuData = cpuRes.timeSeriesData || [];
@@ -379,7 +445,9 @@ export async function getCosts(cfg, appNames, dateRange) {
           usage.cpuSeconds += Number(pt.values?.[0]?.doubleValue || 0);
         }
       }
-    } catch {}
+    } catch (e) {
+      process.stderr.write(`  Warning: failed to fetch CPU metrics: ${e.message}\n`);
+    }
 
     try {
       // Memory allocation
@@ -387,7 +455,7 @@ export async function getCosts(cfg, appNames, dateRange) {
         query: `fetch cloud_run_revision
           | metric 'run.googleapis.com/container/memory/allocation_time'
           | filter resource.service_name == '${app.serviceName}'
-          | within d'${sinceISO}', d'${untilISO}'
+          | within d'${sinceMql}', d'${untilMql}'
           | group_by [], sum(val())`,
       });
       var memData = memRes.timeSeriesData || [];
@@ -397,12 +465,19 @@ export async function getCosts(cfg, appNames, dateRange) {
           usage.memGibSeconds += Number(pt.values?.[0]?.doubleValue || 0);
         }
       }
-    } catch {}
+    } catch (e) {
+      process.stderr.write(`  Warning: failed to fetch memory metrics: ${e.message}\n`);
+    }
 
     results.push({ name: app.name, usage });
   }
 
   return results;
+}
+
+function isoToMql(iso) {
+  // Convert 2026-03-01T00:00:00Z -> 2026/03/01-00:00:00
+  return iso.replace(/Z$/, "").replace(/^(\d{4})-(\d{2})-(\d{2})T/, "$1/$2/$3-");
 }
 
 // --- Regions ---

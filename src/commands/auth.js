@@ -168,7 +168,7 @@ async function authGCP(rl) {
   var SA_URL =
     "https://console.cloud.google.com/iam-admin/serviceaccounts/create";
   var ENABLE_APIS =
-    "https://console.cloud.google.com/apis/enableflow?apiid=run.googleapis.com,artifactregistry.googleapis.com,sqladmin.googleapis.com,dns.googleapis.com,logging.googleapis.com,monitoring.googleapis.com";
+    "https://console.cloud.google.com/apis/enableflow?apiid=run.googleapis.com,artifactregistry.googleapis.com,sqladmin.googleapis.com,dns.googleapis.com,logging.googleapis.com,monitoring.googleapis.com,firebase.googleapis.com,firebasehosting.googleapis.com";
 
   process.stderr.write(`\n  ${kleur.bold("Setup")}\n\n`);
   process.stderr.write(`  1. Enable the required APIs:\n`);
@@ -181,6 +181,8 @@ async function authGCP(rl) {
   process.stderr.write(`       ${fmt.val("Service Account User")}\n`);
   process.stderr.write(`       ${fmt.val("Cloud SQL Admin")}\n`);
   process.stderr.write(`       ${fmt.val("DNS Administrator")}\n`);
+  process.stderr.write(`       ${fmt.val("Firebase Admin")}\n`);
+  process.stderr.write(`       ${fmt.val("Firebase Hosting Admin")}\n`);
   process.stderr.write(`       ${fmt.val("Logs Viewer")}\n`);
   process.stderr.write(`       ${fmt.val("Monitoring Viewer")}\n\n`);
   process.stderr.write(`  3. Go to the service account → ${kleur.bold("Keys")} tab\n`);

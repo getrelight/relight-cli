@@ -23,22 +23,25 @@ export async function ps(name, options) {
   // Fetch live metrics
   var metrics = await appProvider.getContainerStatus(cfg, name);
 
-  // Aggregate: group by region + durableObjectId, keep only active instances
+  // Aggregate: group by region + id, keep only active instances
   var containers = [];
   for (var row of metrics) {
     var dim = row.dimensions;
-    if (!dim.active) continue;
-    var existing = containers.find(
-      (c) => c.region === dim.region && c.doId === dim.durableObjectId
-    );
+    if (dim.active === false) continue;
+    var id = dim.durableObjectId || dim.hostname || null;
+    var region = dim.region || dim.hostname || "-";
+    var existing = id ? containers.find(
+      (c) => c.region === region && c.id === id
+    ) : null;
     if (existing) {
       existing.cpuSamples++;
       existing.cpuLoad += row.avg?.cpuLoad || 0;
       existing.memory += row.avg?.memory || 0;
     } else {
       containers.push({
-        region: dim.region,
-        doId: dim.durableObjectId,
+        region,
+        id,
+        status: dim.status || null,
         cpuLoad: row.avg?.cpuLoad || 0,
         memory: row.avg?.memory || 0,
         cpuSamples: 1,
@@ -49,7 +52,7 @@ export async function ps(name, options) {
     c.cpuLoad = c.cpuLoad / c.cpuSamples;
     c.memory = c.memory / c.cpuSamples;
   }
-  containers.sort((a, b) => a.region.localeCompare(b.region) || a.doId.localeCompare(b.doId));
+  containers.sort((a, b) => (a.region || "").localeCompare(b.region || ""));
 
   if (options.json) {
     console.log(
@@ -61,7 +64,8 @@ export async function ps(name, options) {
           instances,
           containers: containers.map((c) => ({
             region: c.region,
-            id: c.doId,
+            id: c.id || null,
+            status: c.status || null,
             cpu: +(c.cpuLoad * 100).toFixed(1),
             memoryMiB: +(c.memory / 1024 / 1024).toFixed(0),
           })),
@@ -102,11 +106,12 @@ export async function ps(name, options) {
   console.log(`\n${fmt.bold("Containers:")}`);
 
   if (containers.length > 0) {
-    var headers = ["", "REGION", "ID", "CPU", "MEMORY"];
+    var hasIds = containers.some((c) => c.id);
+    var headers = hasIds ? ["", "REGION", "ID", "CPU", "MEMORY"] : ["", "REGION", "STATUS", "CPU", "MEMORY"];
     var rows = containers.map((c) => [
       kleur.green("*"),
       c.region,
-      c.doId.slice(0, 8),
+      hasIds ? (c.id || "-").slice(0, 8) : (c.status || "running"),
       (c.cpuLoad * 100).toFixed(1) + "%",
       (c.memory / 1024 / 1024).toFixed(0) + " MiB",
     ]);

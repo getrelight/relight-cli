@@ -2,6 +2,8 @@ import { createSign } from "crypto";
 import { readFileSync } from "fs";
 
 export var RUN_API = "https://run.googleapis.com/v2";
+var FIREBASE_API = "https://firebase.googleapis.com/v1beta1";
+var FIREBASE_HOSTING_API = "https://firebasehosting.googleapis.com/v1beta1";
 var CRM_API = "https://cloudresourcemanager.googleapis.com/v1";
 var TOKEN_URI = "https://oauth2.googleapis.com/token";
 var SCOPE = "https://www.googleapis.com/auth/cloud-platform";
@@ -98,6 +100,8 @@ export async function gcpApi(method, url, body, token) {
     throw new Error(`GCP API ${method} ${url}: ${res.status} ${text}`);
   }
 
+  var contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("json")) return {};
   return res.json();
 }
 
@@ -351,6 +355,78 @@ export async function listResourceRecordSets(token, project, zoneName) {
     token
   );
   return res.rrsets || [];
+}
+
+// --- Firebase ---
+
+export async function ensureFirebaseProject(token, project) {
+  try {
+    await gcpApi("GET", `${FIREBASE_API}/projects/${project}`, null, token);
+    return;
+  } catch {}
+
+  // Try to add Firebase programmatically
+  try {
+    var op = await gcpApi("POST", `${FIREBASE_API}/projects/${project}:addFirebase`, {}, token);
+    if (op.name && !op.done) {
+      while (true) {
+        var status = await gcpApi("GET", `${FIREBASE_API}/${op.name}`, null, token);
+        if (status.done) {
+          if (status.error) throw new Error(status.error.message);
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+    return;
+  } catch {
+    throw new Error(
+      "Could not enable Firebase for this project.\n" +
+      "  This usually means the Firebase Terms of Service have not been accepted.\n" +
+      "  Visit https://console.firebase.google.com/ and add your GCP project there first."
+    );
+  }
+}
+
+// --- Firebase Hosting ---
+
+export async function createHostingSite(token, project, siteId) {
+  return gcpApi("POST", `${FIREBASE_HOSTING_API}/projects/${project}/sites?siteId=${siteId}`, {}, token);
+}
+
+export async function getHostingSite(token, project, siteId) {
+  return gcpApi("GET", `${FIREBASE_HOSTING_API}/projects/${project}/sites/${siteId}`, null, token);
+}
+
+export async function deleteHostingSite(token, project, siteId) {
+  return gcpApi("DELETE", `${FIREBASE_HOSTING_API}/projects/${project}/sites/${siteId}`, null, token);
+}
+
+export async function deployHostingProxy(token, siteId, serviceId, region) {
+  // Create version with Cloud Run rewrite
+  var version = await gcpApi("POST", `${FIREBASE_HOSTING_API}/sites/${siteId}/versions`, {
+    config: {
+      rewrites: [{ glob: "**", run: { serviceId, region } }],
+    },
+  }, token);
+
+  var versionId = version.name.split("/").pop();
+
+  // Finalize version
+  await gcpApi("PATCH", `${FIREBASE_HOSTING_API}/sites/${siteId}/versions/${versionId}?update_mask=status`, {
+    status: "FINALIZED",
+  }, token);
+
+  // Create release
+  await gcpApi("POST", `${FIREBASE_HOSTING_API}/sites/${siteId}/releases?versionName=sites/${siteId}/versions/${versionId}`, {}, token);
+}
+
+export async function addHostingCustomDomain(token, project, siteId, domain) {
+  return gcpApi("POST", `${FIREBASE_HOSTING_API}/projects/${project}/sites/${siteId}/customDomains?customDomainId=${domain}`, {}, token);
+}
+
+export async function deleteHostingCustomDomain(token, project, siteId, domain) {
+  return gcpApi("DELETE", `${FIREBASE_HOSTING_API}/projects/${project}/sites/${siteId}/customDomains/${domain}`, null, token);
 }
 
 // --- Cloud Logging ---

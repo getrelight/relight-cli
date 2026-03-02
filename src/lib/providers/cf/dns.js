@@ -107,7 +107,7 @@ export async function removeDomain(cfg, appName, domain) {
 
 // --- Pure DNS record operations (for cross-cloud use) ---
 
-export async function addDnsRecord(cfg, domain, target, zone) {
+export async function addDnsRecord(cfg, domain, target, zone, opts = {}) {
   // Check for existing records
   var existing = await listDnsRecords(cfg.accountId, cfg.apiToken, zone.id, { name: domain });
   if (existing.length > 0) {
@@ -117,12 +117,12 @@ export async function addDnsRecord(cfg, domain, target, zone) {
     );
   }
 
-  // Create CNAME: domain -> target, proxied
+  var proxied = opts.proxied !== undefined ? opts.proxied : true;
   await createDnsRecord(cfg.accountId, cfg.apiToken, zone.id, {
     type: "CNAME",
     name: domain,
     content: target,
-    proxied: true,
+    proxied,
   });
 }
 

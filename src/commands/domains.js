@@ -144,12 +144,23 @@ export async function domainsAdd(args, options) {
   rl.close();
 
   if (crossCloud) {
-    // Cross-cloud: DNS record on one cloud, app config on another
+    // Cross-cloud: set up domain mapping on the app cloud first (e.g. Firebase Hosting for GCP)
+    var dnsTarget;
+    var dnsProxied = true;
+    if (appProvider.mapCustomDomain) {
+      status(`Setting up hosting for ${domain}...`);
+      var mapping = await appProvider.mapCustomDomain(appCfg, name, domain);
+      dnsTarget = mapping.dnsTarget;
+      if (mapping.proxied === false) dnsProxied = false;
+    } else {
+      var appUrl = await appProvider.getAppUrl(appCfg, name);
+      dnsTarget = new URL(appUrl).hostname;
+    }
+
+    // Create DNS record pointing to the hosting provider
     status(`Creating DNS record for ${domain}...`);
-    var appUrl = await appProvider.getAppUrl(appCfg, name);
-    var dnsTarget = new URL(appUrl).hostname;
     try {
-      await dnsProvider.addDnsRecord(dnsCfg, domain, dnsTarget, zone);
+      await dnsProvider.addDnsRecord(dnsCfg, domain, dnsTarget, zone, { proxied: dnsProxied });
     } catch (e) {
       fatal(e.message);
     }
@@ -209,6 +220,12 @@ export async function domainsRemove(args, options) {
     await dnsProvider.removeDnsRecord(dnsCfg, domain);
 
     var appProvider = await target.provider("app");
+
+    // Remove domain mapping on the app cloud if supported
+    if (appProvider.unmapCustomDomain) {
+      await appProvider.unmapCustomDomain(appCfg, name, domain);
+    }
+
     var appConfig = await appProvider.getAppConfig(appCfg, name);
     if (appConfig) {
       appConfig.domains = (appConfig.domains || []).filter((d) => d !== domain);

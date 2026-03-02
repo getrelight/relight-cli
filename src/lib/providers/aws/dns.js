@@ -149,7 +149,7 @@ export async function removeDomain(cfg, appName, domain) {
 
 // --- Pure DNS record operations (for cross-cloud use) ---
 
-export async function addDnsRecord(cfg, domain, target, zone) {
+export async function addDnsRecord(cfg, domain, target, zone, opts = {}) {
   var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
   var fqdn = domain.endsWith(".") ? domain : domain + ".";
   var targetFqdn = target.endsWith(".") ? target : target + ".";
