@@ -1,7 +1,7 @@
 import { createInterface } from "readline";
 import { phase, status, success, fatal, hint, fmt } from "../lib/output.js";
-import { resolveAppName, resolveDns, readLink, linkApp } from "../lib/link.js";
-import { resolveTarget, resolveCloudId, getCloudCfg, getProvider } from "../lib/providers/resolve.js";
+import { resolveAppName, readLink, linkApp } from "../lib/link.js";
+import { resolveStack } from "../lib/providers/resolve.js";
 import kleur from "kleur";
 
 function prompt(rl, question) {
@@ -10,9 +10,8 @@ function prompt(rl, question) {
 
 export async function domainsList(name, options) {
   name = resolveAppName(name);
-  var target = await resolveTarget(options);
-  var cfg = target.cfg;
-  var dnsProvider = await target.provider("dns");
+  var stack = await resolveStack(options, ["dns"]);
+  var { cfg, provider: dnsProvider } = stack.dns;
 
   var result = await dnsProvider.listDomains(cfg, name);
 
@@ -58,16 +57,14 @@ export async function domainsAdd(args, options) {
     domain = null;
   }
 
-  var target = await resolveTarget(options);
-  var appCfg = target.cfg;
-  var appProvider = await target.provider("app");
+  // Resolve app and dns providers - may be different
+  var appStack = await resolveStack(options, ["app"]);
+  var { cfg: appCfg, provider: appProvider, name: appProviderName } = appStack.app;
 
-  // Cross-cloud DNS: --dns flag or .relight dns field specifies a different cloud for DNS records
-  var dnsFlag = options.dns || resolveDns();
-  var crossCloud = dnsFlag && (target.kind === "service" || resolveCloudId(dnsFlag) !== target.id);
-  var dnsCloud = crossCloud ? resolveCloudId(dnsFlag) : (target.kind === "cloud" ? target.id : null);
-  var dnsCfg = crossCloud ? getCloudCfg(dnsCloud) : appCfg;
-  var dnsProvider = crossCloud ? await getProvider(dnsCloud, "dns") : await target.provider("dns");
+  var dnsStack = await resolveStack(options, ["dns"]);
+  var { cfg: dnsCfg, provider: dnsProvider, name: dnsProviderName } = dnsStack.dns;
+
+  var crossCloud = appProviderName !== dnsProviderName;
 
   var appConfig = await appProvider.getAppConfig(appCfg, name);
   if (!appConfig) {
@@ -144,7 +141,7 @@ export async function domainsAdd(args, options) {
   rl.close();
 
   if (crossCloud) {
-    // Cross-cloud: set up domain mapping on the app cloud first (e.g. Firebase Hosting for GCP)
+    // Cross-cloud: set up domain mapping on the app provider first
     var dnsTarget;
     var dnsProxied = true;
     if (appProvider.mapCustomDomain) {
@@ -165,7 +162,7 @@ export async function domainsAdd(args, options) {
       fatal(e.message);
     }
 
-    // Update app config on the app cloud/service
+    // Update app config
     status(`Updating app config...`);
     if (!appConfig.domains) appConfig.domains = [];
     if (!appConfig.domains.includes(domain)) {
@@ -173,13 +170,13 @@ export async function domainsAdd(args, options) {
       await appProvider.pushAppConfig(appCfg, name, appConfig);
     }
 
-    // Persist dns cloud in .relight so future commands don't need --dns
+    // Persist dns provider in .relight
     var linked = readLink();
     if (linked && !linked.dns) {
-      linkApp(linked.app, linked.cloud, dnsCloud, undefined, linked.compute);
+      linkApp(linked.app, linked.compute, dnsProviderName, linked.db, linked.dbProvider);
     }
   } else {
-    // Same-cloud: existing flow
+    // Same provider: existing flow
     status(`Attaching ${domain} to relight-${name}...`);
     try {
       await dnsProvider.addDomain(dnsCfg, name, domain, { zone, zones });
@@ -204,24 +201,19 @@ export async function domainsRemove(args, options) {
     fatal("Usage: relight domains remove [name] <domain>");
   }
 
-  var target = await resolveTarget(options);
-  var appCfg = target.cfg;
+  var appStack = await resolveStack(options, ["app"]);
+  var { cfg: appCfg, provider: appProvider, name: appProviderName } = appStack.app;
 
-  var dnsFlag = options.dns || resolveDns();
-  var crossCloud = dnsFlag && (target.kind === "service" || resolveCloudId(dnsFlag) !== target.id);
-  var dnsCloud = crossCloud ? resolveCloudId(dnsFlag) : (target.kind === "cloud" ? target.id : null);
-  var dnsCfg = crossCloud ? getCloudCfg(dnsCloud) : appCfg;
-  var dnsProvider = crossCloud ? await getProvider(dnsCloud, "dns") : await target.provider("dns");
+  var dnsStack = await resolveStack(options, ["dns"]);
+  var { cfg: dnsCfg, provider: dnsProvider, name: dnsProviderName } = dnsStack.dns;
+
+  var crossCloud = appProviderName !== dnsProviderName;
 
   status(`Removing ${domain}...`);
 
   if (crossCloud) {
-    // Cross-cloud: remove DNS record from dns cloud, update app config on app cloud/service
     await dnsProvider.removeDnsRecord(dnsCfg, domain);
 
-    var appProvider = await target.provider("app");
-
-    // Remove domain mapping on the app cloud if supported
     if (appProvider.unmapCustomDomain) {
       await appProvider.unmapCustomDomain(appCfg, name, domain);
     }
@@ -232,7 +224,6 @@ export async function domainsRemove(args, options) {
       await appProvider.pushAppConfig(appCfg, name, appConfig);
     }
   } else {
-    // Same-cloud: existing flow
     await dnsProvider.removeDomain(dnsCfg, name, domain);
   }
 

@@ -1,12 +1,13 @@
 import { createInterface } from "readline";
 import { phase, status, success, hint, fatal, fmt, generateAppName } from "../lib/output.js";
 import { readLink, linkApp, resolveAppName } from "../lib/link.js";
-import { resolveTarget } from "../lib/providers/resolve.js";
+import { resolveStack } from "../lib/providers/resolve.js";
+import { PROVIDERS } from "../lib/config.js";
 import { dockerBuild, dockerTag, dockerPush, dockerLogin } from "../lib/docker.js";
 
 export async function deploy(nameOrPath, path, options) {
-  var target = await resolveTarget(options);
-  var cfg = target.cfg;
+  var stack = await resolveStack(options);
+  var { cfg, provider: appProvider, name: providerName, type: providerType } = stack.app;
 
   // Smart arg parsing: if first arg looks like a path, shift args
   var name;
@@ -23,14 +24,19 @@ export async function deploy(nameOrPath, path, options) {
   }
 
   var tag = options.tag || `${Date.now()}`;
+  var hasRegistry = PROVIDERS[providerType].layers.includes("registry");
 
-  // Get registry credentials and image tag
-  var registry = await target.provider("registry");
-  var remoteTag = await registry.getImageTag(cfg, name, tag);
+  // Get registry credentials and image tag (only for providers with registry)
+  var registry, remoteTag;
   var localTag = `relight-${name}:${tag}`;
 
+  if (hasRegistry) {
+    var registryStack = await resolveStack(options, ["registry"]);
+    registry = registryStack.registry.provider;
+    remoteTag = await registry.getImageTag(registryStack.registry.cfg, name, tag);
+  }
+
   // Load existing config from deployed worker (null on first deploy)
-  var appProvider = await target.provider("app");
   var appConfig;
   try {
     appConfig = await appProvider.getAppConfig(cfg, name);
@@ -40,13 +46,13 @@ export async function deploy(nameOrPath, path, options) {
 
   var isFirstDeploy = !appConfig;
 
-  // Get valid regions for this cloud/service
+  // Get valid regions for this provider
   var validRegions = appProvider.getRegions();
   var validCodes = validRegions.map((r) => r.code);
 
   if (appConfig) {
     // Existing app - update image, merge any flags
-    appConfig.image = remoteTag;
+    appConfig.image = hasRegistry ? remoteTag : localTag;
     appConfig.deployedAt = new Date().toISOString();
 
     if (options.env) {
@@ -88,14 +94,14 @@ export async function deploy(nameOrPath, path, options) {
       }
     }
 
-    var isService = target.kind === "service";
-    var defaultRegion = isService ? "self-hosted" : target.type === "gcp" ? "us-central1" : target.type === "aws" ? "us-east-1" : "enam";
+    var noRegistry = !hasRegistry;
+    var defaultRegion = noRegistry ? "self-hosted" : providerType === "gcp" ? "us-central1" : providerType === "aws" ? "us-east-1" : providerType === "azure" ? "eastus" : "enam";
     var regions;
 
     if (options.regions) {
       regions = options.regions.split(",").map((r) => r.trim());
-    } else if (!isService && (target.type === "gcp" || target.type === "aws") && process.stdin.isTTY) {
-      // Interactive region picker for GCP/AWS first deploy
+    } else if (!noRegistry && (providerType === "gcp" || providerType === "aws" || providerType === "azure") && process.stdin.isTTY) {
+      // Interactive region picker for GCP/AWS/Azure first deploy
       var { createInterface: createRL } = await import("readline");
       var rl = createRL({ input: process.stdin, output: process.stderr });
       process.stderr.write(`\n${fmt.bold("Select a region:")}\n\n`);
@@ -130,10 +136,10 @@ export async function deploy(nameOrPath, path, options) {
     appConfig = {
       name,
       regions,
-      instances: options.instances || (isService ? 1 : 2),
+      instances: options.instances || (noRegistry ? 1 : 2),
       port: options.port || 8080,
       sleepAfter: options.sleep || "30s",
-      instanceType: options.instanceType || (isService || target.type === "gcp" || target.type === "aws" ? undefined : "lite"),
+      instanceType: options.instanceType || (noRegistry || providerType === "gcp" || providerType === "aws" || providerType === "azure" ? undefined : "lite"),
       vcpu: options.vcpu || undefined,
       memory: options.memory || undefined,
       disk: options.disk || undefined,
@@ -141,7 +147,7 @@ export async function deploy(nameOrPath, path, options) {
       envKeys,
       secretKeys: [],
       domains: [],
-      image: remoteTag,
+      image: hasRegistry ? remoteTag : localTag,
       createdAt: new Date().toISOString(),
       deployedAt: new Date().toISOString(),
     };
@@ -157,13 +163,9 @@ export async function deploy(nameOrPath, path, options) {
   process.stderr.write(`\n${fmt.bold("Deploy summary")}\n`);
   process.stderr.write(`${fmt.dim("-".repeat(40))}\n`);
   process.stderr.write(`  ${fmt.bold("App:")}        ${fmt.app(name)}${isFirstDeploy ? fmt.dim(" (new)") : ""}\n`);
-  if (target.kind === "service") {
-    process.stderr.write(`  ${fmt.bold("Service:")}    ${fmt.cloud(target.id)} ${fmt.dim(`(${target.type})`)}\n`);
-  } else {
-    process.stderr.write(`  ${fmt.bold("Cloud:")}      ${fmt.cloud(target.id)}\n`);
-  }
+  process.stderr.write(`  ${fmt.bold("Provider:")}   ${fmt.cloud(providerName)} ${fmt.dim(`(${PROVIDERS[providerType].name})`)}\n`);
   process.stderr.write(`  ${fmt.bold("Path:")}       ${dockerPath}\n`);
-  process.stderr.write(`  ${fmt.bold("Image:")}      ${remoteTag}\n`);
+  process.stderr.write(`  ${fmt.bold("Image:")}      ${hasRegistry ? remoteTag : localTag}\n`);
   process.stderr.write(`  ${fmt.bold("Regions:")}    ${appConfig.regions.join(", ")}\n`);
   process.stderr.write(`  ${fmt.bold("Instances:")}  ${appConfig.instances || 2} per region\n`);
   process.stderr.write(`  ${fmt.bold("Type:")}       ${instanceDesc}\n`);
@@ -188,8 +190,7 @@ export async function deploy(nameOrPath, path, options) {
 
   // 1. Build Docker image
   var platform = "linux/amd64";
-  if (target.type === "slicervm") {
-    // Match VM architecture
+  if (providerType === "slicervm") {
     var { listNodes } = await import("../lib/clouds/slicervm.js");
     var nodes = await listNodes(cfg);
     var vmArch = nodes[0]?.arch;
@@ -199,8 +200,8 @@ export async function deploy(nameOrPath, path, options) {
   status(`${localTag} for ${platform}`);
   dockerBuild(dockerPath, localTag, { platform });
 
-  if (target.kind === "service") {
-    // Service: skip registry push - deploy extracts and uploads the image directly
+  if (!hasRegistry) {
+    // No registry: deploy extracts and uploads the image directly
     phase("Deploying");
     await appProvider.deploy(cfg, name, localTag, {
       appConfig,
@@ -211,9 +212,10 @@ export async function deploy(nameOrPath, path, options) {
     // 2. Push to registry
     phase("Pushing to registry");
     status("Authenticating...");
-    var creds = await registry.getCredentials(cfg);
+    var registryCfg = (await resolveStack(options, ["registry"])).registry.cfg;
+    var creds = await registry.getCredentials(registryCfg);
     dockerLogin(creds.registry, creds.username, creds.password);
-    if (registry.ensureRepository) await registry.ensureRepository(cfg, name);
+    if (registry.ensureRepository) await registry.ensureRepository(registryCfg, name);
     status(`Pushing ${remoteTag}...`);
     dockerTag(localTag, remoteTag);
     dockerPush(remoteTag);
@@ -233,22 +235,18 @@ export async function deploy(nameOrPath, path, options) {
   if (options.json) {
     var result = {
       name,
-      image: remoteTag,
+      image: hasRegistry ? remoteTag : localTag,
       url,
       regions: appConfig.regions,
       instances: appConfig.instances,
       firstDeploy: isFirstDeploy,
+      provider: providerName,
     };
-    if (target.kind === "service") {
-      result.service = target.id;
-    } else {
-      result.cloud = target.id;
-    }
     console.log(JSON.stringify(result, null, 2));
   } else {
     success(`App ${fmt.app(name)} deployed!`);
     process.stderr.write(`  ${fmt.bold("Name:")}  ${fmt.app(name)}\n`);
-    process.stderr.write(`  ${fmt.bold("Image:")} ${remoteTag}\n`);
+    process.stderr.write(`  ${fmt.bold("Image:")} ${hasRegistry ? remoteTag : localTag}\n`);
     process.stderr.write(
       `  ${fmt.bold("URL:")}   ${url ? fmt.url(url) : fmt.dim("(configure workers.dev subdomain to see URL)")}\n`
     );
@@ -256,9 +254,5 @@ export async function deploy(nameOrPath, path, options) {
   }
 
   // Link this directory to the app
-  if (target.kind === "service") {
-    linkApp(name, null, options.dns, null, target.id);
-  } else {
-    linkApp(name, target.id, options.dns);
-  }
+  linkApp(name, providerName, options.dns);
 }

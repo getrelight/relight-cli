@@ -1,6 +1,6 @@
 {
   "name": "relight-cli",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "description": "Deploy web apps across clouds with scale-to-zero",
   "bin": {
     "relight": "./src/cli.js"

@@ -89,6 +89,15 @@ export async function deleteDatabase(apiKey, projectId, branchId, dbName) {
 
 // --- Roles ---
 
+export async function listRoles(apiKey, projectId, branchId) {
+  var res = await neonApi(
+    apiKey,
+    "GET",
+    `/projects/${projectId}/branches/${branchId}/roles`
+  );
+  return res.roles || [];
+}
+
 export async function createRole(apiKey, projectId, branchId, roleName) {
   return neonApi(
     apiKey,

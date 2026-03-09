@@ -1,79 +1,84 @@
-import { resolveCloud } from "../link.js";
-import { resolveCompute } from "../link.js";
-import { getDefaultCloud, resolveCloudConfig, CLOUD_NAMES, tryGetServiceConfig, normalizeServiceConfig } from "../config.js";
+import { readLink } from "../link.js";
+import {
+  PROVIDERS,
+  getProviderConfig,
+  getConfiguredProviders,
+  getDefault,
+  normalizeProviderConfig,
+} from "../config.js";
 import { fatal, fmt } from "../output.js";
 
-var LAYERS = ["app", "dns", "db", "registry"];
+export var LAYERS = ["app", "dns", "db", "registry"];
 
-export function getProvider(cloudId, layer) {
-  if (!LAYERS.includes(layer)) {
-    throw new Error(`Unknown provider layer: ${layer}`);
-  }
+var FLAG_MAP = { app: "compute", dns: "dns", db: "db", registry: "registry" };
 
-  var providers = {
-    cf: () => import(`./cf/${layer}.js`),
-    gcp: () => import(`./gcp/${layer}.js`),
-    aws: () => import(`./aws/${layer}.js`),
-  };
+export async function resolveStack(options, requiredLayers) {
+  if (!requiredLayers) requiredLayers = ["app"];
+  var stack = {};
 
-  if (!providers[cloudId]) {
-    fatal(
-      `Unknown cloud: ${cloudId}`,
-      `Supported: ${Object.keys(CLOUD_NAMES).join(", ")}`
-    );
-  }
+  for (var layer of requiredLayers) {
+    var name = resolveProviderName(options, layer);
+    var instance = getProviderConfig(name);
+    var type = instance.type;
 
-  return providers[cloudId]();
-}
-
-export function resolveCloudId(cloudFlag) {
-  // --cloud flag > .relight file > config.default_cloud > fatal
-  var cloud = cloudFlag || resolveCloud(null) || getDefaultCloud();
-  if (!cloud) {
-    fatal(
-      "No cloud specified.",
-      `Use ${fmt.cmd("--cloud <cf|gcp|aws>")} or set a default with ${fmt.cmd("relight auth")}.`
-    );
-  }
-  if (!CLOUD_NAMES[cloud]) {
-    fatal(
-      `Unknown cloud: ${cloud}`,
-      `Supported: ${Object.keys(CLOUD_NAMES).join(", ")}`
-    );
-  }
-  return cloud;
-}
-
-export function getCloudCfg(cloudId) {
-  return resolveCloudConfig(cloudId);
-}
-
-export async function resolveTarget(options) {
-  // Check if --compute points to a service
-  var computeName = options.compute || resolveCompute();
-  if (computeName) {
-    var service = tryGetServiceConfig(computeName);
-    if (service) {
-      var serviceType = service.type;
-      return {
-        kind: "service",
-        id: computeName,
-        layer: service.layer,
-        type: serviceType,
-        cfg: normalizeServiceConfig(service),
-        provider: (layer) => import(`./${serviceType}/${layer}.js`),
-      };
+    if (!PROVIDERS[type]) {
+      fatal(`Unknown provider type '${type}' for provider '${name}'.`);
     }
+    if (!PROVIDERS[type].layers.includes(layer)) {
+      fatal(
+        `Provider '${name}' (${PROVIDERS[type].name}) doesn't support ${layer}.`,
+        `Supported layers: ${PROVIDERS[type].layers.join(", ")}`
+      );
+    }
+
+    var cfg = { ...normalizeProviderConfig(instance), providerName: name };
+    var provider = await import(`./${type}/${layer}.js`);
+
+    stack[layer] = { name, type, cfg, provider };
   }
 
-  // Fall back to cloud
-  var cloud = resolveCloudId(options.cloud);
-  var cfg = resolveCloudConfig(cloud);
-  return {
-    kind: "cloud",
-    id: cloud,
-    type: cloud,
-    cfg,
-    provider: (layer) => getProvider(cloud, layer),
-  };
+  return stack;
+}
+
+function resolveProviderName(options, layer) {
+  var flag = FLAG_MAP[layer];
+
+  // 1. Explicit flag (--compute, --dns, --db, --registry)
+  if (options[flag]) return options[flag];
+
+  // 2. .relight.yaml
+  var linked = readLink();
+  if (layer === "app" && linked?.compute) return linked.compute;
+  if (layer === "registry" && linked?.compute) return linked.compute;
+  if (layer === "dns") {
+    if (linked?.dns) return linked.dns;
+    if (linked?.compute) return linked.compute;
+  }
+  if (layer === "db" && linked?.dbProvider) return linked.dbProvider;
+
+  // 3. Config defaults
+  var defaultName = getDefault(layer);
+  if (defaultName) return defaultName;
+  if (layer === "registry") {
+    defaultName = getDefault("app");
+    if (defaultName) return defaultName;
+  }
+
+  // 4. Auto-resolve: only one provider supports this layer
+  var candidates = getConfiguredProviders().filter((p) =>
+    PROVIDERS[p.type].layers.includes(layer)
+  );
+  if (candidates.length === 1) return candidates[0].name;
+
+  if (candidates.length === 0) {
+    fatal(
+      `No provider configured for ${layer}.`,
+      `Run ${fmt.cmd("relight providers add")} to add one.`
+    );
+  }
+
+  fatal(
+    `Multiple providers support ${layer}: ${candidates.map((c) => c.name).join(", ")}`,
+    `Use ${fmt.cmd(`--${flag} <name>`)} to pick one.`
+  );
 }

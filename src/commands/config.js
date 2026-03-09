@@ -1,7 +1,7 @@
 import { readFileSync } from "fs";
 import { status, success, fatal, hint, fmt } from "../lib/output.js";
 import { resolveAppName } from "../lib/link.js";
-import { resolveTarget } from "../lib/providers/resolve.js";
+import { resolveStack } from "../lib/providers/resolve.js";
 
 var RESERVED_NAMES = ["RELIGHT_APP_CONFIG", "APP_CONTAINER", "DB", "DB_URL", "DB_TOKEN"];
 
@@ -19,9 +19,8 @@ function ensureKeyLists(appConfig) {
 
 export async function configShow(name, options) {
   name = resolveAppName(name);
-  var target = await resolveTarget(options);
-  var cfg = target.cfg;
-  var appProvider = await target.provider("app");
+  var stack = await resolveStack(options);
+  var { cfg, provider: appProvider } = stack.app;
   var appConfig = await appProvider.getAppConfig(cfg, name);
 
   if (!appConfig) {
@@ -70,9 +69,8 @@ export async function configSet(args, options) {
     fatal("No env vars provided.", "Usage: relight config set [name] KEY=VALUE ...");
   }
 
-  var target = await resolveTarget(options);
-  var cfg = target.cfg;
-  var appProvider = await target.provider("app");
+  var stack = await resolveStack(options);
+  var { cfg, provider: appProvider } = stack.app;
   var appConfig = await appProvider.getAppConfig(cfg, name);
 
   if (!appConfig) {
@@ -126,9 +124,8 @@ export async function configGet(args, options) {
     fatal("Usage: relight config get [name] <key>");
   }
 
-  var target = await resolveTarget(options);
-  var cfg = target.cfg;
-  var appProvider = await target.provider("app");
+  var stack = await resolveStack(options);
+  var { cfg, provider: appProvider } = stack.app;
   var appConfig = await appProvider.getAppConfig(cfg, name);
 
   if (!appConfig) {
@@ -173,9 +170,8 @@ export async function configUnset(args, options) {
     fatal("No keys provided.", "Usage: relight config unset [name] KEY ...");
   }
 
-  var target = await resolveTarget(options);
-  var cfg = target.cfg;
-  var appProvider = await target.provider("app");
+  var stack = await resolveStack(options);
+  var { cfg, provider: appProvider } = stack.app;
   var appConfig = await appProvider.getAppConfig(cfg, name);
 
   if (!appConfig) {
@@ -206,9 +202,8 @@ export async function configUnset(args, options) {
 
 export async function configImport(name, options) {
   name = resolveAppName(name);
-  var target = await resolveTarget(options);
-  var cfg = target.cfg;
-  var appProvider = await target.provider("app");
+  var stack = await resolveStack(options);
+  var { cfg, provider: appProvider } = stack.app;
   var appConfig = await appProvider.getAppConfig(cfg, name);
 
   if (!appConfig) {

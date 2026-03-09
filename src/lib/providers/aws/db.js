@@ -1,11 +1,17 @@
 import { randomBytes } from "crypto";
 import { awsQueryApi, awsJsonApi, xmlVal, xmlList, xmlBlock } from "../../clouds/aws.js";
-import { getCloudMeta, setCloudMeta } from "../../config.js";
+import { getProviderMeta, setProviderMeta } from "../../config.js";
+
+export var IS_POSTGRES = true;
 
 var SHARED_INSTANCE = "relight-shared";
 
 function userName(name) {
   return `app_${name.replace(/-/g, "_")}`;
+}
+
+function appUserName(dbAppName, appName) {
+  return `app_${dbAppName.replace(/-/g, "_")}_${appName.replace(/-/g, "_")}`;
 }
 
 function dbName(name) {
@@ -129,7 +135,7 @@ function getRdsEndpoint(xml) {
 
 async function getOrCreateSharedInstance(cfg) {
   var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
-  var meta = getCloudMeta("aws", "sharedDb");
+  var meta = getProviderMeta(cfg.providerName, "sharedDb");
 
   if (meta && meta.instance) {
     // Verify instance still exists
@@ -145,7 +151,7 @@ async function getOrCreateSharedInstance(cfg) {
       if (endpoint && endpoint.host !== meta.host) {
         meta.host = endpoint.host;
         meta.port = endpoint.port;
-        setCloudMeta("aws", "sharedDb", meta);
+        setProviderMeta(cfg.providerName, "sharedDb", meta);
       }
       return meta;
     } catch (e) {
@@ -197,19 +203,23 @@ async function getOrCreateSharedInstance(cfg) {
     port: endpoint.port,
     masterPassword,
   };
-  setCloudMeta("aws", "sharedDb", meta);
+  setProviderMeta(cfg.providerName, "sharedDb", meta);
 
   return meta;
 }
 
 async function connectAsAdmin(cfg) {
-  var meta = getCloudMeta("aws", "sharedDb");
+  var meta = getProviderMeta(cfg.providerName, "sharedDb");
   if (!meta || !meta.masterPassword) {
     throw new Error("Shared DB master credentials not found. Run `relight db create` first.");
   }
   var url = `postgresql://relight_admin:${encodeURIComponent(meta.masterPassword)}@${meta.host}:${meta.port}/postgres`;
   var client = await connectPg(url);
   return { client, meta };
+}
+
+function buildConnectionUrl(user, password, meta, database) {
+  return `postgresql://${user}:${encodeURIComponent(password)}@${meta.host}:${meta.port}/${database}`;
 }
 
 async function destroySharedInstanceIfEmpty(cfg) {
@@ -232,7 +242,7 @@ async function destroySharedInstanceIfEmpty(cfg) {
     cr,
     cfg.region
   );
-  setCloudMeta("aws", "sharedDb", undefined);
+  setProviderMeta(cfg.providerName, "sharedDb", undefined);
   return true;
 }
 
@@ -254,7 +264,7 @@ export async function createDatabase(cfg, name, opts = {}) {
     await client.end();
   }
 
-  var connectionUrl = `postgresql://${user}:${encodeURIComponent(password)}@${meta.host}:${meta.port}/${database}`;
+  var connectionUrl = buildConnectionUrl(user, password, meta, database);
 
   return {
     dbId: SHARED_INSTANCE,
@@ -266,10 +276,7 @@ export async function createDatabase(cfg, name, opts = {}) {
 }
 
 export async function destroyDatabase(cfg, name, opts = {}) {
-  var dbId = opts.dbId;
-  if (!dbId) {
-    throw new Error("dbId is required to destroy an AWS database.");
-  }
+  var dbId = opts.dbId || SHARED_INSTANCE;
 
   // Legacy per-app instance: delete the whole instance
   if (!isSharedInstance(dbId)) {
@@ -284,9 +291,10 @@ export async function destroyDatabase(cfg, name, opts = {}) {
     return;
   }
 
-  // Shared instance: drop database and user
+  // Shared instance: drop database, owner user, and all per-app users
   var database = dbName(name);
   var user = userName(name);
+  var appUserPrefix = `app_${name.replace(/-/g, "_")}_`;
 
   var { client } = await connectAsAdmin(cfg);
   try {
@@ -295,6 +303,16 @@ export async function destroyDatabase(cfg, name, opts = {}) {
       `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${database}' AND pid <> pg_backend_pid()`
     );
     await client.query(`DROP DATABASE IF EXISTS ${database}`);
+
+    // Drop all per-app users (app_<dbName>_<appName>)
+    var rolesRes = await client.query(
+      "SELECT rolname FROM pg_roles WHERE rolname LIKE $1", [appUserPrefix + "%"]
+    );
+    for (var row of rolesRes.rows) {
+      await client.query(`DROP USER IF EXISTS ${row.rolname}`);
+    }
+
+    // Drop the owner user
     await client.query(`DROP USER IF EXISTS ${user}`);
   } finally {
     await client.end();
@@ -305,10 +323,7 @@ export async function destroyDatabase(cfg, name, opts = {}) {
 }
 
 export async function getDatabaseInfo(cfg, name, opts = {}) {
-  var dbId = opts.dbId;
-  if (!dbId) {
-    throw new Error("dbId is required to get AWS database info.");
-  }
+  var dbId = opts.dbId || SHARED_INSTANCE;
 
   var database = dbName(name);
   var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
@@ -338,11 +353,18 @@ export async function getDatabaseInfo(cfg, name, opts = {}) {
 }
 
 export async function queryDatabase(cfg, name, sql, params, opts = {}) {
-  if (!opts.connectionUrl) {
-    throw new Error("connectionUrl is required to query an AWS database.");
+  var connectionUrl = opts.connectionUrl;
+  if (!connectionUrl) {
+    // Build admin connection to the app's database
+    var meta = getProviderMeta(cfg.providerName, "sharedDb");
+    if (!meta || !meta.masterPassword) {
+      throw new Error("Shared DB master credentials not found. Run `relight db create` first.");
+    }
+    var database = dbName(name);
+    connectionUrl = `postgresql://relight_admin:${encodeURIComponent(meta.masterPassword)}@${meta.host}:${meta.port}/${database}`;
   }
 
-  var client = await connectPg(opts.connectionUrl);
+  var client = await connectPg(connectionUrl);
 
   try {
     var result = await client.query(sql, params || []);
@@ -356,11 +378,17 @@ export async function queryDatabase(cfg, name, sql, params, opts = {}) {
 }
 
 export async function importDatabase(cfg, name, sqlContent, opts = {}) {
-  if (!opts.connectionUrl) {
-    throw new Error("connectionUrl is required to import into an AWS database.");
+  var connectionUrl = opts.connectionUrl;
+  if (!connectionUrl) {
+    var meta = getProviderMeta(cfg.providerName, "sharedDb");
+    if (!meta || !meta.masterPassword) {
+      throw new Error("Shared DB master credentials not found. Run `relight db create` first.");
+    }
+    var database = dbName(name);
+    connectionUrl = `postgresql://relight_admin:${encodeURIComponent(meta.masterPassword)}@${meta.host}:${meta.port}/${database}`;
   }
 
-  var client = await connectPg(opts.connectionUrl);
+  var client = await connectPg(connectionUrl);
 
   try {
     await client.query(sqlContent);
@@ -370,12 +398,18 @@ export async function importDatabase(cfg, name, sqlContent, opts = {}) {
 }
 
 export async function exportDatabase(cfg, name, opts = {}) {
-  if (!opts.connectionUrl) {
-    throw new Error("connectionUrl is required to export an AWS database.");
+  var connectionUrl = opts.connectionUrl;
+  if (!connectionUrl) {
+    var meta = getProviderMeta(cfg.providerName, "sharedDb");
+    if (!meta || !meta.masterPassword) {
+      throw new Error("Shared DB master credentials not found. Run `relight db create` first.");
+    }
+    var database = dbName(name);
+    connectionUrl = `postgresql://relight_admin:${encodeURIComponent(meta.masterPassword)}@${meta.host}:${meta.port}/${database}`;
   }
 
   var database = dbName(name);
-  var client = await connectPg(opts.connectionUrl);
+  var client = await connectPg(connectionUrl);
 
   try {
     var tablesRes = await client.query(
@@ -431,10 +465,7 @@ export async function exportDatabase(cfg, name, opts = {}) {
 }
 
 export async function rotateToken(cfg, name, opts = {}) {
-  var dbId = opts.dbId;
-  if (!dbId) {
-    throw new Error("dbId is required to rotate an AWS database token.");
-  }
+  var dbId = opts.dbId || SHARED_INSTANCE;
 
   var newPassword = randomBytes(24).toString("base64url");
   var connectionUrl;
@@ -449,7 +480,7 @@ export async function rotateToken(cfg, name, opts = {}) {
     } finally {
       await client.end();
     }
-    connectionUrl = `postgresql://${user}:${encodeURIComponent(newPassword)}@${meta.host}:${meta.port}/${database}`;
+    connectionUrl = buildConnectionUrl(user, newPassword, meta, database);
   } else {
     // Legacy: update RDS master password
     var cr = { accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey };
@@ -481,11 +512,17 @@ export async function rotateToken(cfg, name, opts = {}) {
 }
 
 export async function resetDatabase(cfg, name, opts = {}) {
-  if (!opts.connectionUrl) {
-    throw new Error("connectionUrl is required to reset an AWS database.");
+  var connectionUrl = opts.connectionUrl;
+  if (!connectionUrl) {
+    var meta = getProviderMeta(cfg.providerName, "sharedDb");
+    if (!meta || !meta.masterPassword) {
+      throw new Error("Shared DB master credentials not found. Run `relight db create` first.");
+    }
+    var database = dbName(name);
+    connectionUrl = `postgresql://relight_admin:${encodeURIComponent(meta.masterPassword)}@${meta.host}:${meta.port}/${database}`;
   }
 
-  var client = await connectPg(opts.connectionUrl);
+  var client = await connectPg(connectionUrl);
 
   try {
     var tablesRes = await client.query(
@@ -500,5 +537,106 @@ export async function resetDatabase(cfg, name, opts = {}) {
     return tables;
   } finally {
     await client.end();
+  }
+}
+
+// --- Stateless API ---
+
+export async function listManagedDatabases(cfg) {
+  var { client, meta } = await connectAsAdmin(cfg);
+  try {
+    var res = await client.query(
+      "SELECT datname FROM pg_database WHERE datname LIKE 'relight_%' ORDER BY datname"
+    );
+    return res.rows.map((r) => ({
+      name: r.datname.replace(/^relight_/, "").replace(/_/g, "-"),
+      dbName: r.datname,
+      dbId: SHARED_INSTANCE,
+      connectionUrl: `postgresql://${userName(r.datname.replace(/^relight_/, ""))}:****@${meta.host}:${meta.port}/${r.datname}`,
+    }));
+  } finally {
+    await client.end();
+  }
+}
+
+export async function getAttachCredentials(cfg, dbAppName, appName) {
+  var { client, meta } = await connectAsAdmin(cfg);
+  var database = dbName(dbAppName);
+  var user = appUserName(dbAppName, appName);
+  var password = randomBytes(24).toString("base64url");
+
+  try {
+    // Create per-app user (or reset password if exists)
+    var exists = await client.query(
+      "SELECT 1 FROM pg_roles WHERE rolname = $1", [user]
+    );
+    if (exists.rows.length > 0) {
+      await client.query(`ALTER USER ${user} WITH PASSWORD '${password.replace(/'/g, "''")}'`);
+    } else {
+      await client.query(`CREATE USER ${user} WITH PASSWORD '${password.replace(/'/g, "''")}'`);
+    }
+
+    // Grant access to the database and its objects
+    await client.query(`GRANT CONNECT ON DATABASE ${database} TO ${user}`);
+  } finally {
+    await client.end();
+  }
+
+  // Grant schema-level privileges (must connect to the target database)
+  var dbUrl = buildConnectionUrl("relight_admin", meta.masterPassword, meta, database);
+  var dbClient = await connectPg(dbUrl);
+  try {
+    await dbClient.query(`GRANT USAGE ON SCHEMA public TO ${user}`);
+    await dbClient.query(`GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${user}`);
+    await dbClient.query(`GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${user}`);
+    await dbClient.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO ${user}`);
+    await dbClient.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO ${user}`);
+  } finally {
+    await dbClient.end();
+  }
+
+  var connectionUrl = buildConnectionUrl(user, password, meta, database);
+  return { connectionUrl, token: password, isPostgres: true };
+}
+
+export async function revokeAppAccess(cfg, dbAppName, appName) {
+  var { client, meta } = await connectAsAdmin(cfg);
+  var database = dbName(dbAppName);
+  var user = appUserName(dbAppName, appName);
+
+  try {
+    // Check if user exists
+    var exists = await client.query(
+      "SELECT 1 FROM pg_roles WHERE rolname = $1", [user]
+    );
+    if (exists.rows.length === 0) return;
+
+    // Revoke and drop
+    await client.query(`REVOKE CONNECT ON DATABASE ${database} FROM ${user}`);
+  } finally {
+    await client.end();
+  }
+
+  // Revoke schema-level privileges (must connect to target database)
+  var dbUrl = buildConnectionUrl("relight_admin", meta.masterPassword, meta, database);
+  var dbClient = await connectPg(dbUrl);
+  try {
+    await dbClient.query(`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM ${user}`);
+    await dbClient.query(`REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM ${user}`);
+    await dbClient.query(`REVOKE USAGE ON SCHEMA public FROM ${user}`);
+    await dbClient.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL PRIVILEGES ON TABLES FROM ${user}`);
+    await dbClient.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL PRIVILEGES ON SEQUENCES FROM ${user}`);
+  } finally {
+    await dbClient.end();
+  }
+
+  // Drop user (reconnect to postgres db)
+  var adminClient = await connectPg(
+    buildConnectionUrl("relight_admin", meta.masterPassword, meta, "postgres")
+  );
+  try {
+    await adminClient.query(`DROP USER IF EXISTS ${user}`);
+  } finally {
+    await adminClient.end();
   }
 }

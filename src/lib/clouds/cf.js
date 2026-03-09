@@ -401,6 +401,24 @@ export async function enableWorkerSubdomain(accountId, apiToken, scriptName) {
 
 // --- D1 databases ---
 
+export async function listD1Databases(accountId, apiToken) {
+  var allDbs = [];
+  var page = 1;
+  while (true) {
+    var res = await cfApi(
+      "GET",
+      `/accounts/${accountId}/d1/database?page=${page}&per_page=50`,
+      null,
+      apiToken
+    );
+    var databases = res.result || [];
+    allDbs.push(...databases);
+    if (databases.length < 50) break;
+    page++;
+  }
+  return allDbs;
+}
+
 export async function createD1Database(accountId, apiToken, name, { locationHint, jurisdiction } = {}) {
   var body = { name };
   if (jurisdiction) body.jurisdiction = jurisdiction;

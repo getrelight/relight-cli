@@ -7,62 +7,80 @@ var CONFIG_PATH = join(CONFIG_DIR, "config.json");
 
 export { CONFIG_DIR, CONFIG_PATH };
 
-export var CLOUD_NAMES = {
-  cf: "Cloudflare",
-  gcp: "GCP",
-  aws: "AWS",
+export var PROVIDERS = {
+  cf: { name: "Cloudflare", layers: ["app", "db", "dns", "registry"] },
+  gcp: { name: "Google Cloud", layers: ["app", "db", "dns", "registry"] },
+  aws: { name: "AWS", layers: ["app", "db", "dns", "registry"] },
+  azure: { name: "Azure", layers: ["app", "db", "dns", "registry"] },
+  neon: { name: "Neon", layers: ["db"] },
+  turso: { name: "Turso", layers: ["db"] },
+  slicervm: { name: "SlicerVM", layers: ["app"] },
 };
 
-export var CLOUD_IDS = Object.keys(CLOUD_NAMES);
-
-export var SERVICE_TYPES = {
-  slicervm: { layer: "compute", name: "SlicerVM" },
-  neon: { layer: "db", name: "Neon" },
-};
+export var PROVIDER_TYPES = Object.keys(PROVIDERS);
 
 export function getConfig() {
   if (!existsSync(CONFIG_PATH)) {
-    console.error("Not authenticated. Run `relight auth` first.");
+    console.error("Not authenticated. Run `relight providers add` first.");
     process.exit(1);
   }
   var config = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-  return migrateSlicervm(config);
-}
-
-function migrateSlicervm(config) {
-  if (config.clouds && config.clouds.slicervm) {
-    if (!config.services) config.services = {};
-    if (!config.services.slicervm) {
-      var old = config.clouds.slicervm;
-      config.services.slicervm = {
-        layer: "compute",
-        type: "slicervm",
-        ...old,
-      };
-    }
-    delete config.clouds.slicervm;
-    if (config.default_cloud === "slicervm") {
-      delete config.default_cloud;
-    }
-    saveConfig(config);
-  }
-  // Migrate old "addons" key to "services"
-  if (config.addons && !config.services) {
-    config.services = config.addons;
-    delete config.addons;
-    saveConfig(config);
-  }
-  return config;
+  return migrateConfig(config);
 }
 
 export function tryGetConfig() {
   if (!existsSync(CONFIG_PATH)) return null;
   try {
     var config = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-    return migrateSlicervm(config);
+    return migrateConfig(config);
   } catch {
     return null;
   }
+}
+
+// Migrate old clouds/services/default_cloud format to unified providers/defaults
+function migrateConfig(config) {
+  if (!config.clouds && !config.services) return config;
+
+  if (!config.providers) config.providers = {};
+  if (!config.defaults) config.defaults = {};
+
+  // Migrate clouds (cf, gcp, aws, azure)
+  if (config.clouds) {
+    for (var [id, data] of Object.entries(config.clouds)) {
+      if (data && Object.keys(data).length > 0 && !config.providers[id]) {
+        config.providers[id] = { type: id, ...data };
+      }
+    }
+    delete config.clouds;
+  }
+
+  // Migrate services (slicervm, neon, turso instances)
+  if (config.services) {
+    for (var [name, data] of Object.entries(config.services)) {
+      if (data && !config.providers[name]) {
+        var { layer, ...rest } = data;
+        config.providers[name] = rest;
+      }
+    }
+    delete config.services;
+  }
+
+  // Migrate default_cloud -> defaults
+  if (config.default_cloud) {
+    var dc = config.default_cloud;
+    if (config.providers[dc]) {
+      var type = config.providers[dc].type;
+      var layers = PROVIDERS[type]?.layers || [];
+      for (var layer of layers) {
+        if (!config.defaults[layer]) config.defaults[layer] = dc;
+      }
+    }
+    delete config.default_cloud;
+  }
+
+  saveConfig(config);
+  return config;
 }
 
 export function saveConfig(config) {
@@ -70,187 +88,105 @@ export function saveConfig(config) {
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
 }
 
-export function getCloudConfig(cloudId) {
+export function getProviderConfig(name) {
   var config = getConfig();
-  var cloud = config.clouds && config.clouds[cloudId];
-  if (!cloud) {
+  var provider = config.providers && config.providers[name];
+  if (!provider) {
     console.error(
-      `Not authenticated with ${CLOUD_NAMES[cloudId] || cloudId}. Run \`relight auth --cloud ${cloudId}\` first.`
+      `Provider '${name}' not found. Run \`relight providers add\` to register it.`
     );
     process.exit(1);
   }
-  return cloud;
+  return provider;
 }
 
-export function getAuthenticatedClouds() {
+export function tryGetProviderConfig(name) {
   var config = tryGetConfig();
-  if (!config || !config.clouds) return [];
-  return Object.keys(config.clouds).filter(
-    (id) => config.clouds[id] && Object.keys(config.clouds[id]).length > 0
-  );
+  if (!config || !config.providers) return null;
+  return config.providers[name] || null;
 }
 
-export function getDefaultCloud() {
+export function getConfiguredProviders() {
   var config = tryGetConfig();
-  if (!config) return null;
-  return config.default_cloud || null;
-}
-
-export function resolveCloudConfig(cloudId) {
-  var config = getConfig();
-  var cloud = config.clouds && config.clouds[cloudId];
-  if (!cloud) {
-    console.error(
-      `Not authenticated with ${CLOUD_NAMES[cloudId] || cloudId}. Run \`relight auth --cloud ${cloudId}\` first.`
-    );
-    process.exit(1);
-  }
-
-  // Return a normalized config object that providers can use
-  if (cloudId === "cf") {
-    return { accountId: cloud.accountId, apiToken: cloud.token };
-  }
-  if (cloudId === "gcp") {
-    return { clientEmail: cloud.clientEmail, privateKey: cloud.privateKey, project: cloud.project };
-  }
-  if (cloudId === "aws") {
-    return { accessKeyId: cloud.accessKeyId, secretAccessKey: cloud.secretAccessKey, region: cloud.region };
-  }
-  return cloud;
-}
-
-export function getServiceConfig(name) {
-  var config = getConfig();
-  var service = config.services && config.services[name];
-  if (!service) {
-    console.error(
-      `Service '${name}' not found. Run \`relight service add\` to register it.`
-    );
-    process.exit(1);
-  }
-  return service;
-}
-
-export function tryGetServiceConfig(name) {
-  var config = tryGetConfig();
-  if (!config || !config.services) return null;
-  return config.services[name] || null;
-}
-
-export function getRegisteredServices() {
-  var config = tryGetConfig();
-  if (!config || !config.services) return [];
-  return Object.entries(config.services).map(([name, service]) => ({
-    name,
-    ...service,
-  }));
-}
-
-export function saveServiceConfig(name, data) {
-  var config = tryGetConfig() || { clouds: {} };
-  if (!config.services) config.services = {};
-  config.services[name] = data;
-  saveConfig(config);
-}
-
-export function removeServiceConfig(name) {
-  var config = tryGetConfig();
-  if (!config || !config.services) return;
-  delete config.services[name];
-  saveConfig(config);
-}
-
-export function getCloudMeta(cloudId, key) {
-  var config = tryGetConfig();
-  if (!config || !config.clouds || !config.clouds[cloudId]) return undefined;
-  var meta = config.clouds[cloudId]._meta;
-  if (!meta) return undefined;
-  return key ? meta[key] : meta;
-}
-
-export function setCloudMeta(cloudId, key, value) {
-  var config = getConfig();
-  if (!config.clouds[cloudId]._meta) config.clouds[cloudId]._meta = {};
-  if (value === undefined) {
-    delete config.clouds[cloudId]._meta[key];
-    if (Object.keys(config.clouds[cloudId]._meta).length === 0) {
-      delete config.clouds[cloudId]._meta;
-    }
-  } else {
-    config.clouds[cloudId]._meta[key] = value;
-  }
-  saveConfig(config);
-}
-
-export function getServiceMeta(serviceName, key) {
-  var config = tryGetConfig();
-  if (!config || !config.services || !config.services[serviceName]) return undefined;
-  var meta = config.services[serviceName]._meta;
-  if (!meta) return undefined;
-  return key ? meta[key] : meta;
-}
-
-export function setServiceMeta(serviceName, key, value) {
-  var config = getConfig();
-  if (!config.services || !config.services[serviceName]) {
-    throw new Error(`Service '${serviceName}' not found.`);
-  }
-  if (!config.services[serviceName]._meta) config.services[serviceName]._meta = {};
-  if (value === undefined) {
-    delete config.services[serviceName]._meta[key];
-    if (Object.keys(config.services[serviceName]._meta).length === 0) {
-      delete config.services[serviceName]._meta;
-    }
-  } else {
-    config.services[serviceName]._meta[key] = value;
-  }
-  saveConfig(config);
-}
-
-// --- Database registry ---
-
-export function getDatabaseConfig(name) {
-  var config = tryGetConfig();
-  if (!config || !config.databases) return null;
-  return config.databases[name] || null;
-}
-
-export function saveDatabaseConfig(name, data) {
-  var config = tryGetConfig() || { clouds: {} };
-  if (!config.databases) config.databases = {};
-  config.databases[name] = data;
-  saveConfig(config);
-}
-
-export function removeDatabaseConfig(name) {
-  var config = tryGetConfig();
-  if (!config || !config.databases) return;
-  delete config.databases[name];
-  saveConfig(config);
-}
-
-export function listDatabases() {
-  var config = tryGetConfig();
-  if (!config || !config.databases) return [];
-  return Object.entries(config.databases).map(([name, data]) => ({
+  if (!config || !config.providers) return [];
+  return Object.entries(config.providers).map(([name, data]) => ({
     name,
     ...data,
   }));
 }
 
-export function normalizeServiceConfig(service) {
-  if (service.type === "slicervm") {
-    var cfg = { hostGroup: service.hostGroup, baseDomain: service.baseDomain };
-    if (service.socketPath) {
-      cfg.socketPath = service.socketPath;
+export function saveProviderConfig(name, data) {
+  var config = tryGetConfig() || {};
+  if (!config.providers) config.providers = {};
+  config.providers[name] = data;
+  saveConfig(config);
+}
+
+export function removeProviderConfig(name) {
+  var config = tryGetConfig();
+  if (!config || !config.providers) return;
+  delete config.providers[name];
+  if (config.defaults) {
+    for (var layer of Object.keys(config.defaults)) {
+      if (config.defaults[layer] === name) delete config.defaults[layer];
+    }
+  }
+  saveConfig(config);
+}
+
+export function getDefault(layer) {
+  var config = tryGetConfig();
+  if (!config || !config.defaults) return null;
+  return config.defaults[layer] || null;
+}
+
+export function setDefault(layer, name) {
+  var config = tryGetConfig() || {};
+  if (!config.defaults) config.defaults = {};
+  config.defaults[layer] = name;
+  saveConfig(config);
+}
+
+export function getProviderMeta(name, key) {
+  var config = tryGetConfig();
+  if (!config || !config.providers || !config.providers[name]) return undefined;
+  var meta = config.providers[name]._meta;
+  if (!meta) return undefined;
+  return key ? meta[key] : meta;
+}
+
+export function setProviderMeta(name, key, value) {
+  var config = getConfig();
+  if (!config.providers || !config.providers[name]) {
+    throw new Error(`Provider '${name}' not found.`);
+  }
+  if (!config.providers[name]._meta) config.providers[name]._meta = {};
+  if (value === undefined) {
+    delete config.providers[name]._meta[key];
+    if (Object.keys(config.providers[name]._meta).length === 0) {
+      delete config.providers[name]._meta;
+    }
+  } else {
+    config.providers[name]._meta[key] = value;
+  }
+  saveConfig(config);
+}
+
+export function normalizeProviderConfig(instance) {
+  var { type, _meta, ...rest } = instance;
+
+  if (type === "cf") {
+    return { accountId: rest.accountId, apiToken: rest.token };
+  }
+  if (type === "slicervm") {
+    var cfg = { hostGroup: rest.hostGroup, baseDomain: rest.baseDomain };
+    if (rest.socketPath) {
+      cfg.socketPath = rest.socketPath;
     } else {
-      cfg.apiUrl = service.apiUrl;
-      cfg.apiToken = service.token;
+      cfg.apiUrl = rest.apiUrl;
+      cfg.apiToken = rest.token;
     }
     return cfg;
   }
-  if (service.type === "neon") {
-    return { apiKey: service.apiKey };
-  }
-  return service;
+  return rest;
 }

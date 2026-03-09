@@ -6,16 +6,23 @@ import {
   listDatabases,
   createDatabase as neonCreateDb,
   deleteDatabase as neonDeleteDb,
+  listRoles,
   createRole,
   deleteRole,
   getRolePassword,
   resetRolePassword,
   getConnectionUri,
 } from "../../clouds/neon.js";
-import { getServiceMeta, setServiceMeta } from "../../config.js";
+import { getProviderMeta, setProviderMeta } from "../../config.js";
+
+export var IS_POSTGRES = true;
 
 function userName(appName) {
   return `app_${appName.replace(/-/g, "_")}`;
+}
+
+function appUserName(dbAppName, appName) {
+  return `app_${dbAppName.replace(/-/g, "_")}_${appName.replace(/-/g, "_")}`;
 }
 
 function dbName(appName) {
@@ -31,7 +38,7 @@ async function connectPg(connectionUrl) {
 }
 
 async function getOrCreateSharedProject(cfg) {
-  var meta = getServiceMeta(cfg.serviceName, "sharedProject");
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
 
   if (meta && meta.projectId) {
     // Verify project still exists
@@ -67,12 +74,12 @@ async function getOrCreateSharedProject(cfg) {
   }
 
   meta = { projectId, branchId };
-  setServiceMeta(cfg.serviceName, "sharedProject", meta);
+  setProviderMeta(cfg.providerName, "sharedProject", meta);
   return meta;
 }
 
 async function destroySharedProjectIfEmpty(cfg) {
-  var meta = getServiceMeta(cfg.serviceName, "sharedProject");
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
   if (!meta) return false;
 
   var databases = await listDatabases(cfg.apiKey, meta.projectId, meta.branchId);
@@ -81,7 +88,7 @@ async function destroySharedProjectIfEmpty(cfg) {
 
   // No relight databases remain - destroy the project
   await deleteProject(cfg.apiKey, meta.projectId);
-  setServiceMeta(cfg.serviceName, "sharedProject", undefined);
+  setProviderMeta(cfg.providerName, "sharedProject", undefined);
   return true;
 }
 
@@ -112,13 +119,33 @@ export async function createDatabase(cfg, appName, opts = {}) {
 }
 
 export async function destroyDatabase(cfg, appName, opts = {}) {
-  var meta = getServiceMeta(cfg.serviceName, "sharedProject");
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
   if (!meta) throw new Error("No shared Neon project found.");
 
   var database = dbName(appName);
   var user = userName(appName);
+  var appUserPrefix = `app_${appName.replace(/-/g, "_")}_`;
 
-  // Delete database then role
+  // Delete per-app roles first (app_<dbName>_<appName>)
+  try {
+    var branchId = meta.branchId;
+    if (!branchId) {
+      var branches = await listBranches(cfg.apiKey, meta.projectId);
+      branchId = branches.find((b) => b.primary)?.id;
+    }
+    if (branchId) {
+      var roles = await listRoles(cfg.apiKey, meta.projectId, branchId);
+      for (var role of roles) {
+        if (role.name.startsWith(appUserPrefix)) {
+          try {
+            await deleteRole(cfg.apiKey, meta.projectId, branchId, role.name);
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+
+  // Delete database then owner role
   try {
     await neonDeleteDb(cfg.apiKey, meta.projectId, meta.branchId, database);
   } catch (e) {
@@ -136,7 +163,7 @@ export async function destroyDatabase(cfg, appName, opts = {}) {
 }
 
 export async function getDatabaseInfo(cfg, appName, opts = {}) {
-  var meta = getServiceMeta(cfg.serviceName, "sharedProject");
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
   if (!meta) throw new Error("No shared Neon project found.");
 
   var database = dbName(appName);
@@ -162,7 +189,7 @@ export async function getDatabaseInfo(cfg, appName, opts = {}) {
 }
 
 export async function queryDatabase(cfg, appName, sql, params, opts = {}) {
-  var meta = getServiceMeta(cfg.serviceName, "sharedProject");
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
   if (!meta) throw new Error("No shared Neon project found.");
 
   var database = dbName(appName);
@@ -183,7 +210,7 @@ export async function queryDatabase(cfg, appName, sql, params, opts = {}) {
 }
 
 export async function importDatabase(cfg, appName, sqlContent, opts = {}) {
-  var meta = getServiceMeta(cfg.serviceName, "sharedProject");
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
   if (!meta) throw new Error("No shared Neon project found.");
 
   var database = dbName(appName);
@@ -200,7 +227,7 @@ export async function importDatabase(cfg, appName, sqlContent, opts = {}) {
 }
 
 export async function exportDatabase(cfg, appName, opts = {}) {
-  var meta = getServiceMeta(cfg.serviceName, "sharedProject");
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
   if (!meta) throw new Error("No shared Neon project found.");
 
   var database = dbName(appName);
@@ -263,7 +290,7 @@ export async function exportDatabase(cfg, appName, opts = {}) {
 }
 
 export async function rotateToken(cfg, appName, opts = {}) {
-  var meta = getServiceMeta(cfg.serviceName, "sharedProject");
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
   if (!meta) throw new Error("No shared Neon project found.");
 
   var database = dbName(appName);
@@ -280,7 +307,7 @@ export async function rotateToken(cfg, appName, opts = {}) {
 }
 
 export async function resetDatabase(cfg, appName, opts = {}) {
-  var meta = getServiceMeta(cfg.serviceName, "sharedProject");
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
   if (!meta) throw new Error("No shared Neon project found.");
 
   var database = dbName(appName);
@@ -302,5 +329,68 @@ export async function resetDatabase(cfg, appName, opts = {}) {
     return tables;
   } finally {
     await client.end();
+  }
+}
+
+// --- Stateless API ---
+
+export async function listManagedDatabases(cfg) {
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
+  if (!meta) return [];
+
+  var databases = await listDatabases(cfg.apiKey, meta.projectId, meta.branchId);
+  return databases
+    .filter((d) => d.name.startsWith("relight_"))
+    .map((d) => ({
+      name: d.name.replace(/^relight_/, "").replace(/_/g, "-"),
+      dbName: d.name,
+      dbId: meta.projectId,
+      connectionUrl: null,
+    }));
+}
+
+export async function getAttachCredentials(cfg, dbAppName, appName) {
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
+  if (!meta) throw new Error("No shared Neon project found.");
+
+  var database = dbName(dbAppName);
+  var user = appUserName(dbAppName, appName);
+
+  // Create per-app role if it doesn't exist
+  try {
+    await createRole(cfg.apiKey, meta.projectId, meta.branchId, user);
+  } catch (e) {
+    // Role may already exist
+    if (!e.message.includes("already exists") && !e.message.includes("409")) throw e;
+  }
+
+  // Grant access via SQL
+  var ownerUser = userName(dbAppName);
+  var ownerUrl = await getConnectionUri(cfg.apiKey, meta.projectId, database, ownerUser);
+  var client = await connectPg(ownerUrl);
+  try {
+    await client.query(`GRANT USAGE ON SCHEMA public TO ${user}`);
+    await client.query(`GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${user}`);
+    await client.query(`GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${user}`);
+    await client.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO ${user}`);
+    await client.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO ${user}`);
+  } finally {
+    await client.end();
+  }
+
+  var connectionUrl = await getConnectionUri(cfg.apiKey, meta.projectId, database, user);
+  return { connectionUrl, token: null, isPostgres: true };
+}
+
+export async function revokeAppAccess(cfg, dbAppName, appName) {
+  var meta = getProviderMeta(cfg.providerName, "sharedProject");
+  if (!meta) return;
+
+  var user = appUserName(dbAppName, appName);
+
+  try {
+    await deleteRole(cfg.apiKey, meta.projectId, meta.branchId, user);
+  } catch (e) {
+    if (!e.message.includes("404")) throw e;
   }
 }

@@ -6,8 +6,19 @@ import {
   exportD1,
   importD1,
   getWorkersSubdomain,
+  listD1Databases,
 } from "../../clouds/cf.js";
 import { randomBytes } from "crypto";
+
+export var IS_POSTGRES = false;
+
+async function resolveD1Id(cfg, name) {
+  var d1Name = `relight-${name}`;
+  var databases = await listD1Databases(cfg.accountId, cfg.apiToken);
+  var found = databases.find((db) => db.name === d1Name);
+  if (!found) throw new Error(`D1 database '${d1Name}' not found.`);
+  return found.uuid;
+}
 
 export async function createDatabase(cfg, name, opts = {}) {
   var d1Name = `relight-${name}`;
@@ -32,25 +43,21 @@ export async function createDatabase(cfg, name, opts = {}) {
 }
 
 export async function destroyDatabase(cfg, name, opts = {}) {
-  if (!opts.dbId) {
-    throw new Error("dbId is required to destroy a CF database.");
-  }
-  await deleteD1Database(cfg.accountId, cfg.apiToken, opts.dbId);
+  var dbId = opts.dbId || await resolveD1Id(cfg, name);
+  await deleteD1Database(cfg.accountId, cfg.apiToken, dbId);
 }
 
 export async function getDatabaseInfo(cfg, name, opts = {}) {
-  if (!opts.dbId) {
-    throw new Error("dbId is required to get CF database info.");
-  }
+  var dbId = opts.dbId || await resolveD1Id(cfg, name);
 
-  var dbDetails = await getD1Database(cfg.accountId, cfg.apiToken, opts.dbId);
+  var dbDetails = await getD1Database(cfg.accountId, cfg.apiToken, dbId);
   var subdomain = await getWorkersSubdomain(cfg.accountId, cfg.apiToken);
   var connectionUrl = subdomain
     ? `https://relight-${name}.${subdomain}.workers.dev`
     : null;
 
   return {
-    dbId: opts.dbId,
+    dbId,
     dbName: dbDetails.name || `relight-${name}`,
     connectionUrl,
     size: dbDetails.file_size,
@@ -60,17 +67,12 @@ export async function getDatabaseInfo(cfg, name, opts = {}) {
 }
 
 export async function queryDatabase(cfg, name, sql, params, opts = {}) {
-  if (!opts.dbId) {
-    throw new Error("dbId is required to query a CF database.");
-  }
-  return queryD1(cfg.accountId, cfg.apiToken, opts.dbId, sql, params);
+  var dbId = opts.dbId || await resolveD1Id(cfg, name);
+  return queryD1(cfg.accountId, cfg.apiToken, dbId, sql, params);
 }
 
 export async function importDatabase(cfg, name, sqlContent, opts = {}) {
-  if (!opts.dbId) {
-    throw new Error("dbId is required to import into a CF database.");
-  }
-  var dbId = opts.dbId;
+  var dbId = opts.dbId || await resolveD1Id(cfg, name);
 
   // Step 1: Init import
   var initRes = await importD1(cfg.accountId, cfg.apiToken, dbId, {
@@ -116,10 +118,7 @@ export async function importDatabase(cfg, name, sqlContent, opts = {}) {
 }
 
 export async function exportDatabase(cfg, name, opts = {}) {
-  if (!opts.dbId) {
-    throw new Error("dbId is required to export a CF database.");
-  }
-  var dbId = opts.dbId;
+  var dbId = opts.dbId || await resolveD1Id(cfg, name);
 
   var exportRes = await exportD1(cfg.accountId, cfg.apiToken, dbId, {
     output_format: "polling",
@@ -161,10 +160,7 @@ export async function rotateToken(cfg, name, opts = {}) {
 }
 
 export async function resetDatabase(cfg, name, opts = {}) {
-  if (!opts.dbId) {
-    throw new Error("dbId is required to reset a CF database.");
-  }
-  var dbId = opts.dbId;
+  var dbId = opts.dbId || await resolveD1Id(cfg, name);
 
   var results = await queryD1(
     cfg.accountId, cfg.apiToken, dbId,
@@ -178,4 +174,29 @@ export async function resetDatabase(cfg, name, opts = {}) {
   }
 
   return tables;
+}
+
+// --- Stateless API ---
+
+export async function listManagedDatabases(cfg) {
+  var databases = await listD1Databases(cfg.accountId, cfg.apiToken);
+  return databases
+    .filter((db) => db.name && db.name.startsWith("relight-"))
+    .map((db) => ({
+      name: db.name.replace(/^relight-/, ""),
+      dbName: db.name,
+      dbId: db.uuid,
+      connectionUrl: null,
+    }));
+}
+
+export async function getAttachCredentials(cfg, name, appName) {
+  var dbId = await resolveD1Id(cfg, name);
+  var subdomain = await getWorkersSubdomain(cfg.accountId, cfg.apiToken);
+  var connectionUrl = subdomain
+    ? `https://relight-${name}.${subdomain}.workers.dev`
+    : null;
+  var token = randomBytes(32).toString("hex");
+
+  return { connectionUrl, token, isPostgres: false };
 }

@@ -1,93 +1,27 @@
 import { phase, status, success, fatal, hint, fmt, table } from "../lib/output.js";
 import { resolveAppName, readLink, linkApp } from "../lib/link.js";
-import { resolveCloudId, getCloudCfg, getProvider } from "../lib/providers/resolve.js";
-import {
-  getDatabaseConfig, saveDatabaseConfig, removeDatabaseConfig, listDatabases,
-  tryGetServiceConfig, normalizeServiceConfig, CLOUD_IDS,
-} from "../lib/config.js";
+import { resolveStack } from "../lib/providers/resolve.js";
 import { createInterface } from "readline";
 import { readFileSync, writeFileSync } from "fs";
 
 // --- Helpers ---
 
-function resolveDatabase(name) {
+function resolveDatabase(name, options) {
   if (!name) {
     var linked = readLink();
     name = linked?.db;
   }
   if (!name) fatal("No database specified.");
-  var entry = getDatabaseConfig(name);
-  if (!entry) fatal(`Database '${name}' not found. Run ${fmt.cmd("relight db list")} to see databases.`);
-  return { name, entry };
-}
-
-async function loadProvider(entry) {
-  var providerId = entry.provider;
-
-  // Check if it's a service
-  var service = tryGetServiceConfig(providerId);
-  if (service && service.layer === "db") {
-    var provider = await import(`../lib/providers/${service.type}/db.js`);
-    var cfg = { ...normalizeServiceConfig(service), serviceName: providerId };
-    return { provider, cfg };
-  }
-
-  // It's a cloud
-  var provider = await getProvider(providerId, "db");
-  var cfg = getCloudCfg(providerId);
-  return { provider, cfg };
-}
-
-function resolveProvider(options) {
-  var provider = options.provider;
-  if (!provider) {
-    var linked = readLink();
-    // Try to infer from linked cloud
-    if (linked?.cloud) provider = linked.cloud;
-  }
-  if (!provider) {
-    fatal(
-      "No provider specified.",
-      `Use ${fmt.cmd("--provider <cf|gcp|aws|service-name>")} to specify the database provider.`
-    );
-  }
-  return provider;
+  return name;
 }
 
 // --- Commands ---
 
 export async function dbCreate(name, options) {
-  if (!name) fatal("Database name is required.", `Usage: relight db create <name> --provider <provider>`);
+  if (!name) fatal("Database name is required.", `Usage: relight db create <name> --db <provider>`);
 
-  // Check if already exists
-  if (getDatabaseConfig(name)) {
-    fatal(`Database '${name}' already exists.`);
-  }
-
-  var providerId = resolveProvider(options);
-
-  // Determine if this is a service or cloud
-  var service = tryGetServiceConfig(providerId);
-  var isService = service && service.layer === "db";
-  var isPostgres;
-  var provider;
-  var cfg;
-
-  if (isService) {
-    provider = await import(`../lib/providers/${service.type}/db.js`);
-    cfg = { ...normalizeServiceConfig(service), serviceName: providerId };
-    isPostgres = true;
-  } else {
-    if (!CLOUD_IDS.includes(providerId)) {
-      fatal(
-        `Unknown provider: ${providerId}`,
-        `Supported: ${CLOUD_IDS.join(", ")} or a registered db service name.`
-      );
-    }
-    provider = await getProvider(providerId, "db");
-    cfg = getCloudCfg(providerId);
-    isPostgres = providerId !== "cf";
-  }
+  var stack = await resolveStack(options, ["db"]);
+  var { cfg, provider, name: providerName } = stack.db;
 
   phase("Creating database");
   if (options.jurisdiction) status(`${name} (jurisdiction: ${options.jurisdiction})...`);
@@ -104,23 +38,16 @@ export async function dbCreate(name, options) {
     fatal(e.message);
   }
 
-  // Save to database registry
-  saveDatabaseConfig(name, {
-    provider: providerId,
-    dbId: result.dbId,
-    dbName: result.dbName,
-    dbUser: result.dbUser || null,
-    dbToken: result.dbToken,
-    connectionUrl: result.connectionUrl,
-    isPostgres,
-    apps: [],
-    createdAt: new Date().toISOString(),
-  });
+  // Update .relight.yaml with db + dbProvider
+  var linked = readLink();
+  if (linked) {
+    linkApp(linked.app, linked.compute, linked.dns, name, providerName);
+  }
 
   if (options.json) {
     console.log(JSON.stringify({
       name,
-      provider: providerId,
+      provider: providerName,
       dbId: result.dbId,
       dbName: result.dbName,
       dbToken: result.dbToken,
@@ -130,7 +57,7 @@ export async function dbCreate(name, options) {
   }
 
   success(`Database ${fmt.app(name)} created!`);
-  console.log(`  ${fmt.bold("Provider:")}  ${providerId}`);
+  console.log(`  ${fmt.bold("Provider:")}  ${providerName}`);
   console.log(`  ${fmt.bold("DB ID:")}     ${result.dbId}`);
   console.log(`  ${fmt.bold("DB Name:")}   ${result.dbName}`);
   if (result.connectionUrl) {
@@ -141,9 +68,7 @@ export async function dbCreate(name, options) {
 }
 
 export async function dbDestroy(name, options) {
-  var resolved = resolveDatabase(name);
-  name = resolved.name;
-  var entry = resolved.entry;
+  name = resolveDatabase(name, options);
 
   if (options.confirm !== name) {
     if (process.stdin.isTTY) {
@@ -163,33 +88,34 @@ export async function dbDestroy(name, options) {
     }
   }
 
-  // Auto-detach from all attached apps
-  if (entry.apps && entry.apps.length > 0) {
-    for (var appName of entry.apps) {
-      process.stderr.write(`  Detaching from ${fmt.app(appName)}...\n`);
-      try {
-        await detachFromApp(entry, appName);
-      } catch (e) {
-        process.stderr.write(`  ${fmt.dim(`Warning: could not detach from ${appName}: ${e.message}`)}\n`);
-      }
-    }
-  }
-
   phase("Destroying database");
 
-  var { provider, cfg } = await loadProvider(entry);
+  var stack = await resolveStack(options, ["db"]);
+  var { cfg, provider } = stack.db;
+
   try {
-    await provider.destroyDatabase(cfg, name, { dbId: entry.dbId });
+    await provider.destroyDatabase(cfg, name);
   } catch (e) {
     fatal(e.message);
   }
 
-  removeDatabaseConfig(name);
   success(`Database ${fmt.app(name)} destroyed.`);
 }
 
 export async function dbList(options) {
-  var databases = listDatabases();
+  var stack = await resolveStack(options, ["db"]);
+  var { cfg, provider } = stack.db;
+
+  if (!provider.listManagedDatabases) {
+    fatal(`Provider doesn't support listing databases.`);
+  }
+
+  var databases;
+  try {
+    databases = await provider.listManagedDatabases(cfg);
+  } catch (e) {
+    fatal(e.message);
+  }
 
   if (options.json) {
     console.log(JSON.stringify(databases, null, 2));
@@ -197,50 +123,40 @@ export async function dbList(options) {
   }
 
   if (databases.length === 0) {
-    console.log(fmt.dim("\n  No databases. Create one with: relight db create <name> --provider <provider>\n"));
+    console.log(fmt.dim("\n  No databases. Create one with: relight db create <name>\n"));
     return;
   }
 
-  var cols = ["NAME", "PROVIDER", "DB NAME", "APPS", "CREATED"];
+  var cols = ["NAME", "DB NAME", "CONNECTION URL"];
   var rows = databases.map((db) => [
     db.name,
-    db.provider,
     db.dbName || "-",
-    (db.apps || []).join(", ") || "-",
-    db.createdAt ? db.createdAt.split("T")[0] : "-",
+    db.connectionUrl || "-",
   ]);
 
   console.log(table(cols, rows));
 }
 
 export async function dbAttach(name, appName, options) {
-  var resolved = resolveDatabase(name);
-  name = resolved.name;
-  var entry = resolved.entry;
-
+  name = resolveDatabase(name, options);
   appName = resolveAppName(appName);
 
-  // Check not already attached
-  if (entry.apps && entry.apps.includes(appName)) {
-    fatal(`Database '${name}' is already attached to '${appName}'.`);
-  }
+  var dbStack = await resolveStack(options, ["db"]);
+  var { cfg: dbCfg, provider: dbProvider, name: dbProviderName } = dbStack.db;
 
-  // Resolve app's cloud/compute
-  var appCloud = resolveCloudId(options.cloud);
-  var appCfg = getCloudCfg(appCloud);
-  var appProvider = await getProvider(appCloud, "app");
-
-  // Check if compute service
-  if (options.compute) {
-    var computeService = tryGetServiceConfig(options.compute);
-    if (computeService) {
-      appProvider = await import(`../lib/providers/${computeService.type}/app.js`);
-      appCfg = normalizeServiceConfig(computeService);
-    }
-  }
+  var appStack = await resolveStack(options, ["app"]);
+  var { cfg: appCfg, provider: appProvider } = appStack.app;
 
   phase("Attaching database");
   status(`${name} -> ${appName}...`);
+
+  // Get attach credentials from provider (per-app user for isolation)
+  var creds;
+  try {
+    creds = await dbProvider.getAttachCredentials(dbCfg, name, appName);
+  } catch (e) {
+    fatal(e.message);
+  }
 
   var appConfig = await appProvider.getAppConfig(appCfg, appName);
   if (!appConfig) {
@@ -251,77 +167,70 @@ export async function dbAttach(name, appName, options) {
   if (!appConfig.secretKeys) appConfig.secretKeys = [];
   if (!appConfig.env) appConfig.env = {};
 
-  // Inject env vars
-  if (entry.isPostgres) {
-    if (entry.connectionUrl) {
-      appConfig.env["DATABASE_URL"] = entry.connectionUrl;
+  // Inject env vars based on provider type
+  var newSecrets = {};
+
+  if (creds.isPostgres) {
+    if (creds.connectionUrl) {
+      appConfig.env["DATABASE_URL"] = creds.connectionUrl;
       if (!appConfig.envKeys.includes("DATABASE_URL")) appConfig.envKeys.push("DATABASE_URL");
     }
   } else {
-    // CF D1
-    appConfig.dbId = entry.dbId;
-    appConfig.dbName = entry.dbName;
-    if (entry.connectionUrl) {
-      appConfig.env["DB_URL"] = entry.connectionUrl;
+    if (creds.connectionUrl) {
+      appConfig.env["DB_URL"] = creds.connectionUrl;
       if (!appConfig.envKeys.includes("DB_URL")) appConfig.envKeys.push("DB_URL");
     }
   }
 
-  appConfig.env["DB_TOKEN"] = "[hidden]";
-  appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
-  appConfig.secretKeys.push("DB_TOKEN");
-  appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
+  if (creds.token) {
+    appConfig.env["DB_TOKEN"] = "[hidden]";
+    appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
+    appConfig.secretKeys.push("DB_TOKEN");
+    appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
+    newSecrets.DB_TOKEN = creds.token;
+  }
 
-  if (entry.dbUser) appConfig.dbUser = entry.dbUser;
+  // Set tracking env vars
+  appConfig.env["RELIGHT_DB"] = name;
+  if (!appConfig.envKeys.includes("RELIGHT_DB")) appConfig.envKeys.push("RELIGHT_DB");
+  appConfig.env["RELIGHT_DB_PROVIDER"] = dbProviderName;
+  if (!appConfig.envKeys.includes("RELIGHT_DB_PROVIDER")) appConfig.envKeys.push("RELIGHT_DB_PROVIDER");
 
   await appProvider.pushAppConfig(appCfg, appName, appConfig, {
-    newSecrets: { DB_TOKEN: entry.dbToken },
+    newSecrets: Object.keys(newSecrets).length > 0 ? newSecrets : undefined,
   });
 
-  // Update registry: add app to entry.apps
-  if (!entry.apps) entry.apps = [];
-  entry.apps.push(appName);
-  saveDatabaseConfig(name, entry);
-
-  // Update .relight.yaml: set db to database name
+  // Update .relight.yaml
   var linked = readLink();
   if (linked && linked.app === appName) {
-    linkApp(linked.app, linked.cloud, linked.dns, name, linked.compute);
+    linkApp(linked.app, linked.compute, linked.dns, name, dbProviderName);
   }
 
   success(`Database ${fmt.app(name)} attached to ${fmt.app(appName)}.`);
 }
 
-// Helper to detach a database from an app (used by dbDetach and dbDestroy)
-async function detachFromApp(entry, appName, options = {}) {
-  var appCloud = options.cloud ? resolveCloudId(options.cloud) : null;
-  if (!appCloud) {
-    var linked = readLink();
-    appCloud = linked?.cloud;
-  }
-  if (!appCloud) {
-    // Try to infer from entry.provider if it's a cloud
-    if (CLOUD_IDS.includes(entry.provider)) {
-      appCloud = entry.provider;
-    }
-  }
-  if (!appCloud) {
-    throw new Error("Cannot determine app cloud. Use --cloud to specify.");
-  }
-
-  var appCfg = getCloudCfg(appCloud);
-  var appProvider = await getProvider(appCloud, "app");
-
-  if (options.compute) {
-    var computeService = tryGetServiceConfig(options.compute);
-    if (computeService) {
-      appProvider = await import(`../lib/providers/${computeService.type}/app.js`);
-      appCfg = normalizeServiceConfig(computeService);
-    }
-  }
+// Helper to detach a database from an app
+async function detachFromApp(appName, options = {}) {
+  var appStack = await resolveStack(options, ["app"]);
+  var { cfg: appCfg, provider: appProvider } = appStack.app;
 
   var appConfig = await appProvider.getAppConfig(appCfg, appName);
   if (!appConfig) return;
+
+  // Revoke per-app database access if provider supports it
+  var dbNameVal = appConfig.env?.RELIGHT_DB;
+  var dbProviderVal = appConfig.env?.RELIGHT_DB_PROVIDER;
+  if (dbNameVal && dbProviderVal) {
+    try {
+      var dbStack = await resolveStack({ db: dbProviderVal }, ["db"]);
+      var { cfg: dbCfg, provider: dbProvider } = dbStack.db;
+      if (dbProvider.revokeAppAccess) {
+        await dbProvider.revokeAppAccess(dbCfg, dbNameVal, appName);
+      }
+    } catch {
+      // Non-fatal - env var cleanup still proceeds
+    }
+  }
 
   // Remove DB env vars
   delete appConfig.dbId;
@@ -332,9 +241,13 @@ async function detachFromApp(entry, appName, options = {}) {
     delete appConfig.env["DB_URL"];
     delete appConfig.env["DB_TOKEN"];
     delete appConfig.env["DATABASE_URL"];
+    delete appConfig.env["RELIGHT_DB"];
+    delete appConfig.env["RELIGHT_DB_PROVIDER"];
   }
   if (appConfig.envKeys) {
-    appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_URL" && k !== "DATABASE_URL");
+    appConfig.envKeys = appConfig.envKeys.filter(
+      (k) => k !== "DB_URL" && k !== "DATABASE_URL" && k !== "RELIGHT_DB" && k !== "RELIGHT_DB_PROVIDER"
+    );
   }
   if (appConfig.secretKeys) {
     appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== "DB_TOKEN");
@@ -346,68 +259,27 @@ async function detachFromApp(entry, appName, options = {}) {
 export async function dbDetach(appName, options) {
   appName = resolveAppName(appName);
 
-  // Find which database is attached to this app
-  var databases = listDatabases();
-  var attached = null;
-  var attachedName = null;
-
-  // Check .relight.yaml first
-  var linked = readLink();
-  if (linked?.db) {
-    var entry = getDatabaseConfig(linked.db);
-    if (entry && entry.apps && entry.apps.includes(appName)) {
-      attached = entry;
-      attachedName = linked.db;
-    }
-  }
-
-  // Search registry
-  if (!attached) {
-    for (var db of databases) {
-      if (db.apps && db.apps.includes(appName)) {
-        attached = db;
-        attachedName = db.name;
-        break;
-      }
-    }
-  }
-
-  if (!attached) {
-    fatal(`No database found attached to '${appName}'.`);
-  }
-
   phase("Detaching database");
-  status(`${attachedName} from ${appName}...`);
+  status(`from ${appName}...`);
 
   try {
-    await detachFromApp(attached, appName, options);
+    await detachFromApp(appName, options);
   } catch (e) {
     fatal(e.message);
   }
 
-  // Update registry: remove app from entry.apps
-  attached.apps = (attached.apps || []).filter((a) => a !== appName);
-  // Remove extra fields added by listDatabases() (like 'name')
-  var cleanEntry = getDatabaseConfig(attachedName);
-  cleanEntry.apps = attached.apps;
-  saveDatabaseConfig(attachedName, cleanEntry);
-
-  success(`Database ${fmt.app(attachedName)} detached from ${fmt.app(appName)}.`);
+  success(`Database detached from ${fmt.app(appName)}.`);
 }
 
 export async function dbInfo(name, options) {
-  var resolved = resolveDatabase(name);
-  name = resolved.name;
-  var entry = resolved.entry;
+  name = resolveDatabase(name, options);
 
-  var { provider, cfg } = await loadProvider(entry);
+  var stack = await resolveStack(options, ["db"]);
+  var { cfg, provider, name: providerName } = stack.db;
 
   var info;
   try {
-    info = await provider.getDatabaseInfo(cfg, name, {
-      dbId: entry.dbId,
-      connectionUrl: entry.connectionUrl,
-    });
+    info = await provider.getDatabaseInfo(cfg, name);
   } catch (e) {
     fatal(e.message);
   }
@@ -415,21 +287,20 @@ export async function dbInfo(name, options) {
   if (options.json) {
     console.log(JSON.stringify({
       name,
-      provider: entry.provider,
+      provider: providerName,
       dbId: info.dbId,
       dbName: info.dbName,
       connectionUrl: info.connectionUrl,
       size: info.size,
       numTables: info.numTables,
-      apps: entry.apps || [],
-      createdAt: info.createdAt || entry.createdAt,
+      createdAt: info.createdAt,
     }, null, 2));
     return;
   }
 
   console.log("");
   console.log(`${fmt.bold("Database:")}   ${fmt.app(name)}`);
-  console.log(`${fmt.bold("Provider:")}   ${entry.provider}`);
+  console.log(`${fmt.bold("Provider:")}   ${providerName}`);
   console.log(`${fmt.bold("DB ID:")}      ${info.dbId}`);
   console.log(`${fmt.bold("DB Name:")}    ${info.dbName}`);
   if (info.size != null) {
@@ -443,33 +314,26 @@ export async function dbInfo(name, options) {
     console.log(`${fmt.bold("DB URL:")}     ${fmt.url(info.connectionUrl)}`);
   }
   console.log(`${fmt.bold("Token:")}      ${fmt.dim("[hidden]")}`);
-  if (entry.apps && entry.apps.length > 0) {
-    console.log(`${fmt.bold("Apps:")}       ${entry.apps.join(", ")}`);
-  }
-  if (info.createdAt || entry.createdAt) {
-    console.log(`${fmt.bold("Created:")}    ${info.createdAt || entry.createdAt}`);
+  if (info.createdAt) {
+    console.log(`${fmt.bold("Created:")}    ${info.createdAt}`);
   }
   console.log("");
 }
 
 export async function dbShell(name, options) {
-  var resolved = resolveDatabase(name);
-  name = resolved.name;
-  var entry = resolved.entry;
+  name = resolveDatabase(name, options);
 
-  var { provider, cfg } = await loadProvider(entry);
+  var stack = await resolveStack(options, ["db"]);
+  var { cfg, provider } = stack.db;
 
   // Verify database exists
   try {
-    await provider.getDatabaseInfo(cfg, name, {
-      dbId: entry.dbId,
-      connectionUrl: entry.connectionUrl,
-    });
+    await provider.getDatabaseInfo(cfg, name);
   } catch (e) {
     fatal(e.message);
   }
 
-  var isPostgres = entry.isPostgres;
+  var isPostgres = provider.IS_POSTGRES;
 
   var rl = createInterface({
     input: process.stdin,
@@ -516,10 +380,7 @@ export async function dbShell(name, options) {
         sql = line;
       }
 
-      var results = await provider.queryDatabase(cfg, name, sql, undefined, {
-        dbId: entry.dbId,
-        connectionUrl: entry.connectionUrl,
-      });
+      var results = await provider.queryDatabase(cfg, name, sql);
       var result = Array.isArray(results) ? results[0] : results;
 
       if (result && result.results && result.results.length > 0) {
@@ -558,18 +419,14 @@ export async function dbQuery(args, options) {
     sql = joined;
   }
 
-  var resolved = resolveDatabase(name);
-  name = resolved.name;
-  var entry = resolved.entry;
+  name = resolveDatabase(name, options);
 
-  var { provider, cfg } = await loadProvider(entry);
+  var stack = await resolveStack(options, ["db"]);
+  var { cfg, provider } = stack.db;
 
   var results;
   try {
-    results = await provider.queryDatabase(cfg, name, sql, undefined, {
-      dbId: entry.dbId,
-      connectionUrl: entry.connectionUrl,
-    });
+    results = await provider.queryDatabase(cfg, name, sql);
   } catch (e) {
     fatal(e.message);
   }
@@ -603,11 +460,10 @@ export async function dbImport(args, options) {
     fatal("Usage: relight db import <name> <path>");
   }
 
-  var resolved = resolveDatabase(name);
-  name = resolved.name;
-  var entry = resolved.entry;
+  name = resolveDatabase(name, options);
 
-  var { provider, cfg } = await loadProvider(entry);
+  var stack = await resolveStack(options, ["db"]);
+  var { cfg, provider } = stack.db;
 
   var sqlContent;
   try {
@@ -620,10 +476,7 @@ export async function dbImport(args, options) {
   status(`File: ${filepath} (${(sqlContent.length / 1024).toFixed(1)} KB)`);
 
   try {
-    await provider.importDatabase(cfg, name, sqlContent, {
-      dbId: entry.dbId,
-      connectionUrl: entry.connectionUrl,
-    });
+    await provider.importDatabase(cfg, name, sqlContent);
   } catch (e) {
     fatal(e.message);
   }
@@ -632,21 +485,17 @@ export async function dbImport(args, options) {
 }
 
 export async function dbExport(name, options) {
-  var resolved = resolveDatabase(name);
-  name = resolved.name;
-  var entry = resolved.entry;
+  name = resolveDatabase(name, options);
 
-  var { provider, cfg } = await loadProvider(entry);
+  var stack = await resolveStack(options, ["db"]);
+  var { cfg, provider } = stack.db;
 
   phase("Exporting database");
   status("Initiating export...");
 
   var dump;
   try {
-    dump = await provider.exportDatabase(cfg, name, {
-      dbId: entry.dbId,
-      connectionUrl: entry.connectionUrl,
-    });
+    dump = await provider.exportDatabase(cfg, name);
   } catch (e) {
     fatal(e.message);
   }
@@ -660,59 +509,17 @@ export async function dbExport(name, options) {
 }
 
 export async function dbToken(name, options) {
-  var resolved = resolveDatabase(name);
-  name = resolved.name;
-  var entry = resolved.entry;
+  name = resolveDatabase(name, options);
 
   if (options.rotate) {
-    var { provider, cfg } = await loadProvider(entry);
+    var stack = await resolveStack(options, ["db"]);
+    var { cfg, provider } = stack.db;
 
     var result;
     try {
-      result = await provider.rotateToken(cfg, name, { dbId: entry.dbId });
+      result = await provider.rotateToken(cfg, name);
     } catch (e) {
       fatal(e.message);
-    }
-
-    // Update registry with new token and connection URL
-    entry.dbToken = result.dbToken;
-    if (result.connectionUrl) entry.connectionUrl = result.connectionUrl;
-    saveDatabaseConfig(name, entry);
-
-    // Update all attached apps
-    if (entry.apps && entry.apps.length > 0) {
-      for (var appName of entry.apps) {
-        status(`Updating ${appName}...`);
-        try {
-          // Re-attach to update the token in the app
-          var appCloud = resolveCloudId(null);
-          var appCfg = getCloudCfg(appCloud);
-          var appProvider = await getProvider(appCloud, "app");
-          var appConfig = await appProvider.getAppConfig(appCfg, appName);
-
-          if (appConfig) {
-            if (!appConfig.envKeys) appConfig.envKeys = [];
-            if (!appConfig.secretKeys) appConfig.secretKeys = [];
-            if (!appConfig.env) appConfig.env = {};
-
-            appConfig.env["DB_TOKEN"] = "[hidden]";
-            if (!appConfig.secretKeys.includes("DB_TOKEN")) appConfig.secretKeys.push("DB_TOKEN");
-            appConfig.envKeys = appConfig.envKeys.filter((k) => k !== "DB_TOKEN");
-
-            if (result.connectionUrl) {
-              var urlKey = entry.isPostgres ? "DATABASE_URL" : "DB_URL";
-              appConfig.env[urlKey] = result.connectionUrl;
-              if (!appConfig.envKeys.includes(urlKey)) appConfig.envKeys.push(urlKey);
-            }
-
-            await appProvider.pushAppConfig(appCfg, appName, appConfig, {
-              newSecrets: { DB_TOKEN: result.dbToken },
-            });
-          }
-        } catch (e) {
-          process.stderr.write(`  ${fmt.dim(`Warning: could not update ${appName}: ${e.message}`)}\n`);
-        }
-      }
     }
 
     success("Token rotated.");
@@ -722,16 +529,11 @@ export async function dbToken(name, options) {
     }
   } else {
     console.log(`${fmt.bold("Token:")}    ${fmt.dim("[hidden] - use --rotate to generate a new token")}`);
-    if (entry.connectionUrl) {
-      console.log(`${fmt.bold("DB URL:")}   ${fmt.url(entry.connectionUrl)}`);
-    }
   }
 }
 
 export async function dbReset(name, options) {
-  var resolved = resolveDatabase(name);
-  name = resolved.name;
-  var entry = resolved.entry;
+  name = resolveDatabase(name, options);
 
   if (options.confirm !== name) {
     if (process.stdin.isTTY) {
@@ -751,17 +553,15 @@ export async function dbReset(name, options) {
     }
   }
 
-  var { provider, cfg } = await loadProvider(entry);
+  var stack = await resolveStack(options, ["db"]);
+  var { cfg, provider } = stack.db;
 
   phase("Resetting database");
   status("Listing tables...");
 
   var tables;
   try {
-    tables = await provider.resetDatabase(cfg, name, {
-      dbId: entry.dbId,
-      connectionUrl: entry.connectionUrl,
-    });
+    tables = await provider.resetDatabase(cfg, name);
   } catch (e) {
     fatal(e.message);
   }

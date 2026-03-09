@@ -2,10 +2,11 @@ import { createInterface } from "readline";
 import { execSync } from "child_process";
 import { existsSync } from "fs";
 import { resolve } from "path";
-import { success, fatal, hint, fmt } from "../lib/output.js";
+import { success, fatal, hint, fmt, table } from "../lib/output.js";
 import {
   tryGetConfig,
   saveConfig,
+  getAuthenticatedClouds,
   CLOUD_NAMES,
   CLOUD_IDS,
 } from "../lib/config.js";
@@ -16,19 +17,35 @@ import {
   verifyProject,
 } from "../lib/clouds/gcp.js";
 import { verifyCredentials as awsVerify } from "../lib/clouds/aws.js";
+import { verifyCredentials as azureVerify } from "../lib/clouds/azure.js";
 import kleur from "kleur";
 
 function prompt(rl, question) {
   return new Promise((resolve) => rl.question(question, resolve));
 }
 
-export async function auth(options) {
-  var compute = options.cloud;
+export async function cloudsList() {
+  var clouds = getAuthenticatedClouds();
 
+  if (clouds.length === 0) {
+    process.stderr.write("No clouds configured.\n");
+    process.stderr.write(
+      `\n${fmt.dim("Hint:")} ${fmt.cmd("relight clouds add")} to add one.\n`
+    );
+    return;
+  }
+
+  var headers = ["ID", "CLOUD"];
+  var rows = clouds.map((id) => [fmt.bold(id), CLOUD_NAMES[id] || id]);
+
+  console.log(table(headers, rows));
+}
+
+export async function cloudsAdd(name) {
   var rl = createInterface({ input: process.stdin, output: process.stderr });
 
-  if (!compute) {
-    process.stderr.write(`\n${kleur.bold("Authenticate with a cloud provider")}\n\n`);
+  if (!name) {
+    process.stderr.write(`\n${kleur.bold("Add a cloud provider")}\n\n`);
     for (var i = 0; i < CLOUD_IDS.length; i++) {
       process.stderr.write(
         `  ${kleur.bold(`[${i + 1}]`)} ${CLOUD_NAMES[CLOUD_IDS[i]]}\n`
@@ -44,25 +61,25 @@ export async function auth(options) {
       fatal("Invalid selection.");
     }
 
-    compute = CLOUD_IDS[idx];
+    name = CLOUD_IDS[idx];
   }
 
-  compute = normalizeCompute(compute);
-  if (!CLOUD_NAMES[compute]) {
+  name = normalizeCloud(name);
+  if (!CLOUD_NAMES[name]) {
     rl.close();
     fatal(
-      `Unknown cloud: ${compute}`,
+      `Unknown cloud: ${name}`,
       `Supported: ${CLOUD_IDS.join(", ")}`
     );
   }
 
   process.stderr.write(
-    `\n${kleur.bold(`Authenticate with ${CLOUD_NAMES[compute]}`)}\n`
+    `\n${kleur.bold(`Authenticate with ${CLOUD_NAMES[name]}`)}\n`
   );
 
   var cloudConfig;
 
-  switch (compute) {
+  switch (name) {
     case "cf":
       cloudConfig = await authCloudflare(rl);
       break;
@@ -72,6 +89,9 @@ export async function auth(options) {
     case "aws":
       cloudConfig = await authAWS(rl);
       break;
+    case "azure":
+      cloudConfig = await authAzure(rl);
+      break;
   }
 
   rl.close();
@@ -79,23 +99,58 @@ export async function auth(options) {
   // Merge into existing config
   var config = tryGetConfig() || { clouds: {} };
   if (!config.clouds) config.clouds = {};
-  config.clouds[compute] = cloudConfig;
+  config.clouds[name] = cloudConfig;
 
   if (!config.default_cloud) {
-    config.default_cloud = compute;
+    config.default_cloud = name;
   }
 
   saveConfig(config);
 
-  success(`Authenticated with ${CLOUD_NAMES[compute]}!`);
+  success(`Authenticated with ${CLOUD_NAMES[name]}!`);
 
-  if (config.default_cloud === compute) {
-    hint("Default", `${CLOUD_NAMES[compute]} is your default cloud`);
+  if (config.default_cloud === name) {
+    hint("Default", `${CLOUD_NAMES[name]} is your default cloud`);
   }
   hint("Next", `relight deploy <name> .`);
 }
 
-function normalizeCompute(input) {
+export async function cloudsRemove(name) {
+  if (!name) {
+    fatal("Usage: relight clouds remove <name>");
+  }
+
+  name = normalizeCloud(name);
+
+  var config = tryGetConfig();
+  if (!config || !config.clouds || !config.clouds[name]) {
+    fatal(`Cloud '${name}' not found.`);
+  }
+
+  var rl = createInterface({ input: process.stdin, output: process.stderr });
+  var answer = await new Promise((resolve) =>
+    rl.question(`Remove cloud '${CLOUD_NAMES[name] || name}'? [y/N] `, resolve)
+  );
+  rl.close();
+
+  if (!answer.match(/^y(es)?$/i)) {
+    process.stderr.write("Cancelled.\n");
+    return;
+  }
+
+  delete config.clouds[name];
+  if (config.default_cloud === name) {
+    var remaining = Object.keys(config.clouds).filter(
+      (id) => config.clouds[id] && Object.keys(config.clouds[id]).length > 0
+    );
+    config.default_cloud = remaining[0] || null;
+  }
+  saveConfig(config);
+
+  success(`Cloud ${fmt.bold(CLOUD_NAMES[name] || name)} removed.`);
+}
+
+function normalizeCloud(input) {
   var aliases = {
     cloudflare: "cf",
     cf: "cf",
@@ -105,6 +160,9 @@ function normalizeCompute(input) {
     aws: "aws",
     amazon: "aws",
     "app-runner": "aws",
+    azure: "azure",
+    microsoft: "azure",
+    "container-apps": "azure",
   };
   return aliases[input.toLowerCase()] || input.toLowerCase();
 }
@@ -296,6 +354,101 @@ async function authAWS(rl) {
   process.stderr.write(`  Region: ${fmt.bold(region)}\n`);
 
   return { accessKeyId, secretAccessKey, region };
+}
+
+// --- Azure ---
+
+async function authAzure(rl) {
+  var PORTAL_URL = "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade";
+
+  process.stderr.write(`\n  ${kleur.bold("Setup")}\n\n`);
+  process.stderr.write(`  1. Open the Azure portal:\n`);
+  process.stderr.write(`     ${fmt.url(PORTAL_URL)}\n\n`);
+  process.stderr.write(`  2. Register an app (or use an existing one)\n`);
+  process.stderr.write(`  3. Go to ${kleur.bold("Certificates & secrets")} → create a client secret\n`);
+  process.stderr.write(`  4. Note the ${kleur.bold("Application (client) ID")} and ${kleur.bold("Directory (tenant) ID")}\n`);
+  process.stderr.write(`  5. In your subscription, assign the app these roles:\n`);
+  process.stderr.write(`     ${fmt.val("Contributor")}\n`);
+  process.stderr.write(`     ${fmt.val("AcrPush")}\n\n`);
+
+  // Detect from env vars
+  var detectedTenant = process.env.AZURE_TENANT_ID || null;
+  var detectedClient = process.env.AZURE_CLIENT_ID || null;
+  var detectedSecret = process.env.AZURE_CLIENT_SECRET || null;
+  var detectedSubscription = process.env.AZURE_SUBSCRIPTION_ID || null;
+
+  var tenantId;
+  if (detectedTenant) {
+    var input = await prompt(rl, `Tenant ID [${detectedTenant.slice(0, 8)}...]: `);
+    tenantId = (input || "").trim() || detectedTenant;
+  } else {
+    tenantId = await prompt(rl, "Tenant ID: ");
+    tenantId = (tenantId || "").trim();
+    if (!tenantId) fatal("No tenant ID provided.");
+  }
+
+  var clientId;
+  if (detectedClient) {
+    var input = await prompt(rl, `Client ID [${detectedClient.slice(0, 8)}...]: `);
+    clientId = (input || "").trim() || detectedClient;
+  } else {
+    clientId = await prompt(rl, "Client ID: ");
+    clientId = (clientId || "").trim();
+    if (!clientId) fatal("No client ID provided.");
+  }
+
+  var clientSecret;
+  if (detectedSecret && clientId === detectedClient) {
+    var input = await prompt(rl, "Client secret [detected]: ");
+    clientSecret = (input || "").trim() || detectedSecret;
+  } else {
+    clientSecret = await prompt(rl, "Client secret: ");
+    clientSecret = (clientSecret || "").trim();
+    if (!clientSecret) fatal("No client secret provided.");
+  }
+
+  var subscriptionId;
+  if (detectedSubscription) {
+    var input = await prompt(rl, `Subscription ID [${detectedSubscription.slice(0, 8)}...]: `);
+    subscriptionId = (input || "").trim() || detectedSubscription;
+  } else {
+    subscriptionId = await prompt(rl, "Subscription ID: ");
+    subscriptionId = (subscriptionId || "").trim();
+    if (!subscriptionId) fatal("No subscription ID provided.");
+  }
+
+  var resourceGroup = await prompt(rl, "Resource group [relight]: ");
+  resourceGroup = (resourceGroup || "").trim() || "relight";
+
+  var location = await prompt(rl, "Default location [eastus]: ");
+  location = (location || "").trim() || "eastus";
+
+  process.stderr.write("\nVerifying...\n");
+  try {
+    await azureVerify(tenantId, clientId, clientSecret, subscriptionId);
+  } catch (e) {
+    fatal("Credential verification failed.", e.message);
+  }
+
+  // Ensure resource group exists
+  try {
+    var { azureApi, mintAccessToken } = await import("../lib/clouds/azure.js");
+    var token = await mintAccessToken(tenantId, clientId, clientSecret);
+    await azureApi("PUT", `/subscriptions/${subscriptionId}/resourceGroups/${resourceGroup}`, {
+      location,
+    }, token);
+  } catch (e) {
+    // Non-fatal - resource group may already exist
+    if (!e.message.includes("already exists") && !e.message.includes("200")) {
+      process.stderr.write(`  ${fmt.dim(`Note: Could not create resource group: ${e.message}`)}\n`);
+    }
+  }
+
+  process.stderr.write(`  Subscription: ${fmt.bold(subscriptionId)}\n`);
+  process.stderr.write(`  Resource group: ${fmt.bold(resourceGroup)}\n`);
+  process.stderr.write(`  Location: ${fmt.bold(location)}\n`);
+
+  return { tenantId, clientId, clientSecret, subscriptionId, resourceGroup, location };
 }
 
 // --- Helpers ---

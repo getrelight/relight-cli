@@ -10,6 +10,7 @@ import {
 } from "../lib/config.js";
 import { verifyConnection } from "../lib/clouds/slicervm.js";
 import { verifyApiKey } from "../lib/clouds/neon.js";
+import { verifyApiToken as verifyTursoToken } from "../lib/clouds/turso.js";
 import kleur from "kleur";
 
 function prompt(rl, question) {
@@ -22,7 +23,7 @@ export async function serviceList() {
   if (services.length === 0) {
     process.stderr.write("No services registered.\n");
     process.stderr.write(
-      `\n${fmt.dim("Hint:")} ${fmt.cmd("relight service add")} to register one.\n`
+      `\n${fmt.dim("Hint:")} ${fmt.cmd("relight services add")} to register one.\n`
     );
     return;
   }
@@ -32,7 +33,7 @@ export async function serviceList() {
     fmt.bold(a.name),
     a.layer,
     SERVICE_TYPES[a.type]?.name || a.type,
-    a.socketPath || a.apiUrl || (a.type === "neon" ? "console.neon.tech" : "-"),
+    a.socketPath || a.apiUrl || (a.type === "neon" ? "console.neon.tech" : a.type === "turso" ? "turso.io" : "-"),
   ]);
 
   console.log(table(headers, rows));
@@ -167,6 +168,57 @@ export async function serviceAdd(name) {
       rl.close();
       fatal("Authentication failed.", e.message);
     }
+  } else if (serviceType === "turso") {
+    process.stderr.write(`\n  ${kleur.bold("Turso API token")}\n\n`);
+    process.stderr.write(
+      `  ${fmt.dim("Get your API token at https://turso.tech/app/settings/api-tokens")}\n\n`
+    );
+
+    var apiToken = await prompt(rl, "API token: ");
+    apiToken = (apiToken || "").trim();
+    if (!apiToken) {
+      rl.close();
+      fatal("No API token provided.");
+    }
+    config.apiToken = apiToken;
+
+    // Verify connection and get orgs
+    process.stderr.write("\nVerifying...\n");
+    var orgs;
+    try {
+      orgs = await verifyTursoToken(apiToken);
+    } catch (e) {
+      rl.close();
+      fatal("Authentication failed.", e.message);
+    }
+
+    if (orgs.length === 0) {
+      rl.close();
+      fatal("No organizations found for this API token.");
+    }
+
+    var orgSlug;
+    if (orgs.length === 1) {
+      orgSlug = orgs[0].slug || orgs[0].name;
+      process.stderr.write(`  Organization: ${fmt.bold(orgSlug)}\n`);
+    } else {
+      process.stderr.write(`\n  ${kleur.bold("Select organization:")}\n\n`);
+      for (var i = 0; i < orgs.length; i++) {
+        var slug = orgs[i].slug || orgs[i].name;
+        process.stderr.write(`  ${kleur.bold(`[${i + 1}]`)} ${slug}\n`);
+      }
+      process.stderr.write("\n");
+      var orgChoice = await prompt(rl, `Select [1-${orgs.length}]: `);
+      var orgIdx = parseInt(orgChoice, 10) - 1;
+      if (isNaN(orgIdx) || orgIdx < 0 || orgIdx >= orgs.length) {
+        rl.close();
+        fatal("Invalid selection.");
+      }
+      orgSlug = orgs[orgIdx].slug || orgs[orgIdx].name;
+    }
+
+    config.orgSlug = orgSlug;
+    process.stderr.write(`  Authenticated with ${fmt.bold(orgSlug)}.\n`);
   }
 
   // 5. Auto-name if not provided
@@ -204,7 +256,7 @@ export async function serviceAdd(name) {
 
 export async function serviceRemove(name) {
   if (!name) {
-    fatal("Usage: relight service remove <name>");
+    fatal("Usage: relight services remove <name>");
   }
 
   if (!tryGetServiceConfig(name)) {

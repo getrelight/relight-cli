@@ -1,13 +1,12 @@
 import { fatal, fmt, table } from "../lib/output.js";
 import { resolveAppName } from "../lib/link.js";
-import { resolveTarget } from "../lib/providers/resolve.js";
+import { resolveStack } from "../lib/providers/resolve.js";
 import kleur from "kleur";
 
 export async function ps(name, options) {
   name = resolveAppName(name);
-  var target = await resolveTarget(options);
-  var cfg = target.cfg;
-  var appProvider = await target.provider("app");
+  var stack = await resolveStack(options);
+  var { cfg, provider: appProvider } = stack.app;
 
   var appConfig = await appProvider.getAppConfig(cfg, name);
 

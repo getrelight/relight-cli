@@ -3,10 +3,9 @@ import { existsSync } from "fs";
 import {
   tryGetConfig,
   CONFIG_PATH,
-  CLOUD_NAMES,
-  SERVICE_TYPES,
-  getRegisteredServices,
-  normalizeServiceConfig,
+  PROVIDERS,
+  getConfiguredProviders,
+  normalizeProviderConfig,
 } from "../lib/config.js";
 import { verifyToken as cfVerify, getWorkersSubdomain } from "../lib/clouds/cf.js";
 import { mintAccessToken, verifyProject as gcpVerifyProject, listAllServices as gcpListServices, gcpApi, AR_API, SQLADMIN_API, DNS_API } from "../lib/clouds/gcp.js";
@@ -47,53 +46,55 @@ export async function doctor() {
       if (!existsSync(CONFIG_PATH)) throw new Error("Not found");
     }) && allGood;
 
-  var config = tryGetConfig();
-  var clouds = config && config.clouds ? config.clouds : {};
-  var authenticatedClouds = Object.keys(clouds).filter(
-    (id) => clouds[id] && Object.keys(clouds[id]).length > 0
-  );
+  var providers = getConfiguredProviders();
 
-  if (authenticatedClouds.length === 0) {
+  if (providers.length === 0) {
     process.stderr.write(
-      `\n  ${SKIP}  No clouds configured. Run ${kleur.bold().cyan("relight auth")} to get started.\n`
+      `\n  ${SKIP}  No providers configured. Run ${kleur.bold().cyan("relight providers add")} to get started.\n`
     );
   }
 
-  // --- Per-cloud checks ---
+  // --- Per-provider checks ---
 
-  for (var cloudId of authenticatedClouds) {
-    process.stderr.write(`\n${kleur.bold(`  ${CLOUD_NAMES[cloudId] || cloudId}`)}\n`);
+  for (var p of providers) {
+    var typeName = PROVIDERS[p.type]?.name || p.type;
+    process.stderr.write(`\n${kleur.bold(`  ${p.name} (${typeName})`)}\n`);
 
-    switch (cloudId) {
+    var cfg = normalizeProviderConfig(p);
+
+    switch (p.type) {
       case "cf":
-        allGood = (await checkCloudflare(clouds.cf)) && allGood;
+        allGood = (await checkCloudflare(cfg)) && allGood;
         break;
       case "gcp":
-        allGood = (await checkGCP(clouds.gcp)) && allGood;
+        allGood = (await checkGCP(cfg)) && allGood;
         break;
       case "aws":
-        allGood = (await checkAWS(clouds.aws)) && allGood;
+        allGood = (await checkAWS(cfg)) && allGood;
         break;
-    }
-  }
-
-  // --- Services ---
-
-  var services = getRegisteredServices();
-  if (services.length > 0) {
-    process.stderr.write(`\n${kleur.bold("  Services")}\n`);
-
-    for (var service of services) {
-      var typeName = SERVICE_TYPES[service.type]?.name || service.type;
-      var endpoint = service.socketPath || service.apiUrl || "unknown";
-
-      allGood =
-        (await asyncCheck(`${service.name} (${typeName} - ${endpoint})`, async () => {
-          if (service.type === "slicervm") {
-            var cfg = normalizeServiceConfig(service);
+      case "azure":
+        allGood = (await checkAzure(cfg)) && allGood;
+        break;
+      case "slicervm":
+        allGood =
+          (await asyncCheck("Connection", async () => {
             await slicerVerify(cfg);
-          }
-        })) && allGood;
+          })) && allGood;
+        break;
+      case "neon":
+        allGood =
+          (await asyncCheck("API key valid", async () => {
+            var { verifyApiKey } = await import("../lib/clouds/neon.js");
+            await verifyApiKey(p.apiKey);
+          })) && allGood;
+        break;
+      case "turso":
+        allGood =
+          (await asyncCheck("API token valid", async () => {
+            var { verifyApiToken } = await import("../lib/clouds/turso.js");
+            await verifyApiToken(p.apiToken);
+          })) && allGood;
+        break;
     }
   }
 
@@ -116,13 +117,13 @@ async function checkCloudflare(cfg) {
 
   ok =
     (await asyncCheck("API token valid", async () => {
-      await cfVerify(cfg.token);
+      await cfVerify(cfg.apiToken);
     })) && ok;
 
   ok =
     (await asyncCheck("Account accessible", async () => {
       var { listAccounts } = await import("../lib/clouds/cf.js");
-      var accounts = await listAccounts(cfg.token);
+      var accounts = await listAccounts(cfg.apiToken);
       if (!accounts.length) throw new Error("No accounts");
       var match = accounts.find((a) => a.id === cfg.accountId);
       if (!match) throw new Error(`Account ${cfg.accountId} not found`);
@@ -130,7 +131,7 @@ async function checkCloudflare(cfg) {
 
   ok =
     (await asyncCheck("Workers subdomain configured", async () => {
-      var sub = await getWorkersSubdomain(cfg.accountId, cfg.token);
+      var sub = await getWorkersSubdomain(cfg.accountId, cfg.apiToken);
       if (!sub) throw new Error("Not configured");
     })) && ok;
 
@@ -215,6 +216,45 @@ async function checkAWS(cfg) {
     (await asyncCheck("Route 53 accessible", async () => {
       await awsRestXmlApi("GET", "/2013-04-01/hostedzone", null, cr);
     })) && ok;
+
+  return ok;
+}
+
+// --- Azure checks ---
+
+async function checkAzure(cfg) {
+  var ok = true;
+
+  var token;
+  ok =
+    (await asyncCheck("Service principal valid", async () => {
+      var { mintAccessToken } = await import("../lib/clouds/azure.js");
+      token = await mintAccessToken(cfg.tenantId, cfg.clientId, cfg.clientSecret);
+    })) && ok;
+
+  if (token) {
+    ok =
+      (await asyncCheck("Subscription accessible", async () => {
+        var { azureApi } = await import("../lib/clouds/azure.js");
+        await azureApi("GET", `/subscriptions/${cfg.subscriptionId}/resourcegroups`, null, token);
+      })) && ok;
+
+    ok =
+      (await asyncCheck("Container Apps accessible", async () => {
+        var { azureApi } = await import("../lib/clouds/azure.js");
+        await azureApi("GET",
+          `/subscriptions/${cfg.subscriptionId}/resourceGroups/${cfg.resourceGroup}/providers/Microsoft.App/containerApps`,
+          null, token, { apiVersion: "2024-03-01" });
+      })) && ok;
+
+    ok =
+      (await asyncCheck("Container Registry accessible", async () => {
+        var { azureApi } = await import("../lib/clouds/azure.js");
+        await azureApi("GET",
+          `/subscriptions/${cfg.subscriptionId}/resourceGroups/${cfg.resourceGroup}/providers/Microsoft.ContainerRegistry/registries`,
+          null, token, { apiVersion: "2023-07-01" });
+      })) && ok;
+  }
 
   return ok;
 }

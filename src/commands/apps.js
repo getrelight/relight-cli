@@ -1,12 +1,11 @@
 import { success, fatal, hint, fmt, table } from "../lib/output.js";
 import { resolveAppName, readLink, unlinkApp } from "../lib/link.js";
-import { resolveTarget } from "../lib/providers/resolve.js";
+import { resolveStack } from "../lib/providers/resolve.js";
 import { createInterface } from "readline";
 
 export async function appsList(options) {
-  var target = await resolveTarget(options);
-  var cfg = target.cfg;
-  var appProvider = await target.provider("app");
+  var stack = await resolveStack(options);
+  var { cfg, provider: appProvider } = stack.app;
 
   var apps = await appProvider.listApps(cfg);
 
@@ -35,9 +34,8 @@ export async function appsList(options) {
 
 export async function appsInfo(name, options) {
   name = resolveAppName(name);
-  var target = await resolveTarget(options);
-  var cfg = target.cfg;
-  var appProvider = await target.provider("app");
+  var stack = await resolveStack(options);
+  var { cfg, provider: appProvider } = stack.app;
 
   var info = await appProvider.getAppInfo(cfg, name);
 
@@ -91,9 +89,8 @@ export async function appsInfo(name, options) {
 
 export async function appsDestroy(name, options) {
   name = resolveAppName(name);
-  var target = await resolveTarget(options);
-  var cfg = target.cfg;
-  var appProvider = await target.provider("app");
+  var stack = await resolveStack(options);
+  var { cfg, provider: appProvider } = stack.app;
 
   if (options.confirm !== name) {
     if (process.stdin.isTTY) {
