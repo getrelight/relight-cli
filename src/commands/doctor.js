@@ -11,6 +11,7 @@ import { verifyToken as cfVerify, getWorkersSubdomain } from "../lib/clouds/cf.j
 import { mintAccessToken, verifyProject as gcpVerifyProject, listAllServices as gcpListServices, gcpApi, AR_API, SQLADMIN_API, DNS_API } from "../lib/clouds/gcp.js";
 import { verifyCredentials as awsVerify, checkAppRunner, awsJsonApi, awsQueryApi, awsRestXmlApi } from "../lib/clouds/aws.js";
 import { verifyConnection as slicerVerify } from "../lib/clouds/slicervm.js";
+import { verifyCredentials as ghcrVerify } from "../lib/clouds/ghcr.js";
 import kleur from "kleur";
 
 var PASS = kleur.green("[ok]");
@@ -74,6 +75,9 @@ export async function doctor() {
         break;
       case "azure":
         allGood = (await checkAzure(cfg)) && allGood;
+        break;
+      case "ghcr":
+        allGood = (await checkGHCR(cfg)) && allGood;
         break;
       case "slicervm":
         allGood =
@@ -255,6 +259,17 @@ async function checkAzure(cfg) {
           null, token, { apiVersion: "2023-07-01" });
       })) && ok;
   }
+
+  return ok;
+}
+
+async function checkGHCR(cfg) {
+  var ok = true;
+
+  ok =
+    (await asyncCheck("Registry credentials valid", async () => {
+      await ghcrVerify(cfg.username, cfg.token);
+    })) && ok;
 
   return ok;
 }

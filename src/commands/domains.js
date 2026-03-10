@@ -173,7 +173,14 @@ export async function domainsAdd(args, options) {
     // Persist dns provider in .relight
     var linked = readLink();
     if (linked && !linked.dns) {
-      linkApp(linked.app, linked.compute, dnsProviderName, linked.db, linked.dbProvider);
+      linkApp(
+        linked.app,
+        linked.compute,
+        dnsProviderName,
+        linked.db,
+        linked.dbProvider,
+        linked.registry
+      );
     }
   } else {
     // Same provider: existing flow

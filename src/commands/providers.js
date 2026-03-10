@@ -26,6 +26,7 @@ import { verifyCredentials as azureVerify } from "../lib/clouds/azure.js";
 import { verifyConnection } from "../lib/clouds/slicervm.js";
 import { verifyApiKey } from "../lib/clouds/neon.js";
 import { verifyApiToken as verifyTursoToken } from "../lib/clouds/turso.js";
+import { verifyCredentials as verifyGHCR } from "../lib/clouds/ghcr.js";
 import kleur from "kleur";
 
 function prompt(rl, question) {
@@ -45,6 +46,9 @@ function normalizeType(input) {
     azure: "azure",
     microsoft: "azure",
     "container-apps": "azure",
+    ghcr: "ghcr",
+    github: "ghcr",
+    "github-container-registry": "ghcr",
     slicervm: "slicervm",
     slicer: "slicervm",
     neon: "neon",
@@ -137,6 +141,9 @@ export async function providersAdd(typeName) {
       break;
     case "azure":
       providerConfig = await authAzure(rl);
+      break;
+    case "ghcr":
+      providerConfig = await authGHCR(rl);
       break;
     case "slicervm":
       providerConfig = await authSlicerVM(rl);
@@ -440,6 +447,59 @@ async function authAWS(rl) {
   return { accessKeyId, secretAccessKey, region };
 }
 
+async function authGHCR(rl) {
+  process.stderr.write(`\n  ${kleur.bold("Setup")}\n\n`);
+  process.stderr.write(`  1. Create a GitHub token that can ${kleur.bold("read")} and ${kleur.bold("write")} packages\n`);
+  process.stderr.write(`  2. For classic tokens, grant ${fmt.val("read:packages")} and ${fmt.val("write:packages")}\n`);
+  process.stderr.write(`  3. If publishing to an org namespace, make sure the token can access that org's packages\n\n`);
+
+  var detectedOwner = process.env.GHCR_OWNER || process.env.GITHUB_REPOSITORY_OWNER || null;
+  var detectedUsername = process.env.GHCR_USERNAME || process.env.GITHUB_ACTOR || null;
+  var detectedToken = process.env.GHCR_TOKEN || process.env.GITHUB_TOKEN || null;
+
+  var owner;
+  if (detectedOwner) {
+    var ownerInput = await prompt(rl, `Package owner/namespace [${detectedOwner}]: `);
+    owner = (ownerInput || "").trim() || detectedOwner;
+  } else {
+    owner = await prompt(rl, "Package owner/namespace: ");
+    owner = (owner || "").trim();
+    if (!owner) fatal("No package owner provided.");
+  }
+
+  var username;
+  if (detectedUsername) {
+    var usernameInput = await prompt(rl, `GitHub username [${detectedUsername}]: `);
+    username = (usernameInput || "").trim() || detectedUsername;
+  } else {
+    username = await prompt(rl, "GitHub username: ");
+    username = (username || "").trim();
+    if (!username) fatal("No username provided.");
+  }
+
+  var token;
+  if (detectedToken) {
+    var tokenInput = await prompt(rl, "GitHub token [detected]: ");
+    token = (tokenInput || "").trim() || detectedToken;
+  } else {
+    token = await prompt(rl, "GitHub token: ");
+    token = (token || "").trim();
+    if (!token) fatal("No token provided.");
+  }
+
+  process.stderr.write("\nVerifying...\n");
+  try {
+    await verifyGHCR(username, token);
+  } catch (e) {
+    fatal("Credential verification failed.", e.message);
+  }
+
+  process.stderr.write(`  Namespace: ${fmt.bold(owner)}\n`);
+  process.stderr.write(`  Username: ${fmt.bold(username)}\n`);
+
+  return { owner, username, token };
+}
+
 async function authAzure(rl) {
   var PORTAL_URL = "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade";
 
@@ -451,7 +511,7 @@ async function authAzure(rl) {
   process.stderr.write(`  4. Note the ${kleur.bold("Application (client) ID")} and ${kleur.bold("Directory (tenant) ID")}\n`);
   process.stderr.write(`  5. In your subscription, assign the app these roles:\n`);
   process.stderr.write(`     ${fmt.val("Contributor")}\n`);
-  process.stderr.write(`     ${fmt.val("AcrPush")}\n\n`);
+  process.stderr.write(`     ${fmt.dim("AcrPush is only needed when using Azure Container Registry")}\n\n`);
 
   var detectedTenant = process.env.AZURE_TENANT_ID || null;
   var detectedClient = process.env.AZURE_CLIENT_ID || null;

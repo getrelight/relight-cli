@@ -53,14 +53,20 @@ function buildEnvVars(appConfig, newSecrets) {
   return envVars;
 }
 
-async function getRegistryConfig(cfg, token) {
-  var { getCredentials } = await import("./registry.js");
-  var creds = await getCredentials(cfg);
-  var server = creds.registry.replace("https://", "").replace("http://", "");
+async function getRegistryConfig(cfg, opts) {
+  var creds = opts?.registryCredentials;
+  if (!creds) {
+    var { getCredentials } = await import("./registry.js");
+    creds = await getCredentials(cfg);
+  }
+
+  var server = (opts?.registryServer || creds.registry)
+    .replace("https://", "")
+    .replace("http://", "");
   return {
     server,
     username: creds.username,
-    passwordSecretRef: "acr-password",
+    passwordSecretRef: "registry-password",
     password: creds.password,
   };
 }
@@ -86,11 +92,11 @@ function buildContainerApp(appConfig, imageTag, newSecrets, env, registryCfg, op
           {
             server: registryCfg.server,
             username: registryCfg.username,
-            passwordSecretRef: "acr-password",
+            passwordSecretRef: "registry-password",
           },
         ],
         secrets: [
-          { name: "acr-password", value: registryCfg.password },
+          { name: "registry-password", value: registryCfg.password },
         ],
         activeRevisionsMode: "Single",
       },
@@ -215,7 +221,7 @@ export async function deploy(cfg, appName, imageTag, opts) {
   var token = await getToken(cfg);
 
   var env = await ensureEnvironment(cfg, token);
-  var registryCfg = await getRegistryConfig(cfg, token);
+  var registryCfg = await getRegistryConfig(cfg, opts);
 
   var path = cappPath(cfg, appName);
   var body = buildContainerApp(appConfig, imageTag, newSecrets, env, registryCfg, {

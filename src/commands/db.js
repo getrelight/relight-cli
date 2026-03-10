@@ -41,7 +41,7 @@ export async function dbCreate(name, options) {
   // Update .relight.yaml with db + dbProvider
   var linked = readLink();
   if (linked) {
-    linkApp(linked.app, linked.compute, linked.dns, name, providerName);
+    linkApp(linked.app, linked.compute, linked.dns, name, providerName, linked.registry);
   }
 
   if (options.json) {
@@ -203,7 +203,7 @@ export async function dbAttach(name, appName, options) {
   // Update .relight.yaml
   var linked = readLink();
   if (linked && linked.app === appName) {
-    linkApp(linked.app, linked.compute, linked.dns, name, dbProviderName);
+    linkApp(linked.app, linked.compute, linked.dns, name, dbProviderName, linked.registry);
   }
 
   success(`Database ${fmt.app(name)} attached to ${fmt.app(appName)}.`);
