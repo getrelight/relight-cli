@@ -1,6 +1,8 @@
 import { azureApi, pollOperation, getToken, rgPath } from "../../clouds/azure.js";
+import { status } from "../../output.js";
 
 var CAPP_API = "2024-03-01";
+var CERT_API = "2025-07-01";
 
 // --- Internal helpers ---
 
@@ -10,6 +12,14 @@ function cappPath(cfg, appName) {
 
 function envPath(cfg) {
   return `${rgPath(cfg)}/providers/Microsoft.App/managedEnvironments/relight-env`;
+}
+
+function certNameForDomain(domain) {
+  return `relight-${domain.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "").slice(0, 50)}`;
+}
+
+function certPath(cfg, domain) {
+  return `${envPath(cfg)}/managedCertificates/${certNameForDomain(domain)}`;
 }
 
 async function ensureEnvironment(cfg, token) {
@@ -28,6 +38,69 @@ async function ensureEnvironment(cfg, token) {
 
   var res = await pollOperation("PUT", path, body, token, { apiVersion: CAPP_API });
   return res;
+}
+
+async function getLiveApp(cfg, appName, token) {
+  return azureApi("GET", cappPath(cfg, appName), null, token, { apiVersion: CAPP_API });
+}
+
+async function getDefaultHostname(cfg, appName, token) {
+  var app = await getLiveApp(cfg, appName, token);
+  return app.properties?.configuration?.ingress?.fqdn || null;
+}
+
+async function waitForManagedCertificate(cfg, domain, token) {
+  var path = certPath(cfg, domain);
+  var lastState = null;
+  for (var i = 0; i < 120; i++) {
+    var cert = await azureApi("GET", path, null, token, { apiVersion: CERT_API });
+    var state = cert.properties?.provisioningState;
+    if (state && state !== lastState) {
+      status(`Managed certificate state: ${state}`);
+      lastState = state;
+    }
+    if (state === "Succeeded") return cert;
+    if (state === "Failed" || state === "Canceled") {
+      throw new Error(`Managed certificate for ${domain} reached state: ${state}`);
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+  throw new Error(`Timed out waiting for managed certificate for ${domain}.`);
+}
+
+async function updateCustomDomainBinding(cfg, appName, domain, binding, token) {
+  var app = await getLiveApp(cfg, appName, token);
+  var registryCfg = await getRegistryConfig(cfg, {});
+  var ingress = app.properties?.configuration?.ingress || {};
+  var customDomains = ingress.customDomains || [];
+  var existing = customDomains.find((d) => d.name === domain);
+
+  if (!existing) {
+    existing = { name: domain };
+    customDomains.push(existing);
+  }
+
+  existing.bindingType = binding.bindingType;
+  if (binding.certificateId) {
+    existing.certificateId = binding.certificateId;
+  } else {
+    delete existing.certificateId;
+  }
+
+  // Azure omits secret values on GET, so rehydrate registry auth on every PUT.
+  app.properties.configuration.registries = [
+    {
+      server: registryCfg.server,
+      username: registryCfg.username,
+      passwordSecretRef: "registry-password",
+    },
+  ];
+  app.properties.configuration.secrets = [
+    { name: "registry-password", value: registryCfg.password },
+  ];
+  app.properties.configuration.ingress.customDomains = customDomains;
+  await pollOperation("PUT", cappPath(cfg, appName), app, token, { apiVersion: CAPP_API });
+  await waitForApp(cfg, appName, token);
 }
 
 function buildEnvVars(appConfig, newSecrets) {
@@ -55,14 +128,23 @@ function buildEnvVars(appConfig, newSecrets) {
 
 async function getRegistryConfig(cfg, opts) {
   var creds = opts?.registryCredentials;
+  var server = opts?.registryServer;
+
   if (!creds) {
-    var { getCredentials } = await import("./registry.js");
-    creds = await getCredentials(cfg);
+    var { resolveStack } = await import("../resolve.js");
+    var registryStack = await resolveStack(opts?.providerOptions || {}, ["registry"]);
+    creds = await registryStack.registry.provider.getCredentials(registryStack.registry.cfg);
+    server = creds.registry;
   }
 
-  var server = (opts?.registryServer || creds.registry)
+  server = (server || creds.registry)
     .replace("https://", "")
     .replace("http://", "");
+
+  if (!creds.username || !creds.password) {
+    throw new Error("Registry credentials are incomplete. Re-check your registry provider config.");
+  }
+
   return {
     server,
     username: creds.username,
@@ -197,12 +279,23 @@ export async function pushAppConfig(cfg, appName, appConfig, opts) {
   var envVars = buildEnvVars(appConfig, newSecrets);
   var vcpu = appConfig.vcpu || 0.25;
   var memory = appConfig.memory ? `${(appConfig.memory / 1024).toFixed(2)}Gi` : "0.5Gi";
+  var registryCfg = await getRegistryConfig(cfg, opts);
 
   // Patch the container
   existing.properties.template.containers[0].env = envVars;
   existing.properties.template.containers[0].image = appConfig.image;
   existing.properties.template.containers[0].resources = { cpu: vcpu, memory };
   existing.properties.template.scale.maxReplicas = appConfig.instances || 2;
+  existing.properties.configuration.registries = [
+    {
+      server: registryCfg.server,
+      username: registryCfg.username,
+      passwordSecretRef: "registry-password",
+    },
+  ];
+  existing.properties.configuration.secrets = [
+    { name: "registry-password", value: registryCfg.password },
+  ];
 
   if (appConfig.port) {
     existing.properties.configuration.ingress.targetPort = appConfig.port;
@@ -345,6 +438,85 @@ export async function getAppUrl(cfg, appName) {
   }
 }
 
+export async function prepareCustomDomain(cfg, appName, domain) {
+  var token = await getToken(cfg);
+  var app = await getLiveApp(cfg, appName, token);
+  var fqdn = app.properties?.configuration?.ingress?.fqdn;
+  var verificationId = app.properties?.customDomainVerificationId;
+  if (!fqdn) {
+    throw new Error(`Could not determine default hostname for ${appName}.`);
+  }
+  if (!verificationId) {
+    throw new Error(`Could not determine custom domain verification ID for ${appName}.`);
+  }
+
+  return {
+    dnsTarget: fqdn,
+    proxied: false,
+    restoreProxied: true,
+    domain,
+    validationRecords: [
+      {
+        type: "TXT",
+        name: `asuid.${domain}`,
+        content: verificationId,
+      },
+    ],
+  };
+}
+
+export async function finalizeCustomDomain(cfg, appName, domain) {
+  var token = await getToken(cfg);
+  var certId = certPath(cfg, domain);
+
+  // Azure requires the hostname to exist on the app before a managed cert can be issued.
+  await updateCustomDomainBinding(cfg, appName, domain, { bindingType: "Disabled" }, token);
+
+  // Create or reconcile the managed certificate once DNS points directly to ACA.
+  await pollOperation(
+    "PUT",
+    certId,
+    {
+      location: cfg.location || "eastus",
+      properties: {
+        subjectName: domain,
+        domainControlValidation: "CNAME",
+      },
+    },
+    token,
+    { apiVersion: CERT_API }
+  );
+
+  var cert = await waitForManagedCertificate(cfg, domain, token);
+  await updateCustomDomainBinding(
+    cfg,
+    appName,
+    domain,
+    { bindingType: "SniEnabled", certificateId: cert.id },
+    token
+  );
+}
+
+export async function unmapCustomDomain(cfg, appName, domain) {
+  var token = await getToken(cfg);
+  var app = await getLiveApp(cfg, appName, token);
+  var ingress = app.properties?.configuration?.ingress || {};
+  var current = ingress.customDomains || [];
+  var next = current.filter((d) => d.name !== domain);
+
+  if (next.length !== current.length) {
+    app.properties.configuration.ingress.customDomains = next;
+    await pollOperation("PUT", cappPath(cfg, appName), app, token, { apiVersion: CAPP_API });
+    await waitForApp(cfg, appName, token);
+  }
+
+  try {
+    await pollOperation("DELETE", certPath(cfg, domain), null, token, { apiVersion: CERT_API });
+  } catch (e) {
+    if (!e.message.includes("404")) throw e;
+  }
+}
+
 // --- Log streaming ---
 
 export async function streamLogs(cfg, appName) {
@@ -442,6 +614,7 @@ export function getRegions() {
     { code: "centralus", name: "Central US", location: "Iowa" },
     { code: "northeurope", name: "North Europe", location: "Ireland" },
     { code: "westeurope", name: "West Europe", location: "Netherlands" },
+    { code: "polandcentral", name: "Poland Central", location: "Warsaw" },
     { code: "uksouth", name: "UK South", location: "London" },
     { code: "southeastasia", name: "Southeast Asia", location: "Singapore" },
     { code: "eastasia", name: "East Asia", location: "Hong Kong" },

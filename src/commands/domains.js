@@ -141,12 +141,18 @@ export async function domainsAdd(args, options) {
   rl.close();
 
   if (crossCloud) {
-    // Cross-cloud: set up domain mapping on the app provider first
+    // Cross-cloud: some providers need a pre-DNS step, others can map immediately.
     var dnsTarget;
     var dnsProxied = true;
-    if (appProvider.mapCustomDomain) {
+    var mapping;
+    if (appProvider.prepareCustomDomain) {
+      status(`Preparing custom domain for ${domain}...`);
+      mapping = await appProvider.prepareCustomDomain(appCfg, name, domain);
+      dnsTarget = mapping.dnsTarget;
+      if (mapping.proxied === false) dnsProxied = false;
+    } else if (appProvider.mapCustomDomain) {
       status(`Setting up hosting for ${domain}...`);
-      var mapping = await appProvider.mapCustomDomain(appCfg, name, domain);
+      mapping = await appProvider.mapCustomDomain(appCfg, name, domain);
       dnsTarget = mapping.dnsTarget;
       if (mapping.proxied === false) dnsProxied = false;
     } else {
@@ -160,6 +166,38 @@ export async function domainsAdd(args, options) {
       await dnsProvider.addDnsRecord(dnsCfg, domain, dnsTarget, zone, { proxied: dnsProxied });
     } catch (e) {
       fatal(e.message);
+    }
+
+    for (var record of mapping?.validationRecords || []) {
+      status(`Creating ${record.type} record for ${record.name}...`);
+      try {
+        await dnsProvider.addDnsRecord(dnsCfg, record.name, record.content, zone, {
+          type: record.type,
+          proxied: false,
+        });
+      } catch (e) {
+        fatal(e.message);
+      }
+    }
+
+    if (appProvider.finalizeCustomDomain) {
+      status(`Finalizing custom domain in ${appProviderName}...`);
+      try {
+        await appProvider.finalizeCustomDomain(appCfg, name, domain, mapping);
+      } catch (e) {
+        fatal(e.message);
+      }
+    }
+
+    if (mapping?.restoreProxied !== undefined && mapping.restoreProxied !== dnsProxied) {
+      status(`Restoring DNS proxy for ${domain}...`);
+      try {
+        await dnsProvider.addDnsRecord(dnsCfg, domain, dnsTarget, zone, {
+          proxied: mapping.restoreProxied,
+        });
+      } catch (e) {
+        fatal(e.message);
+      }
     }
 
     // Update app config

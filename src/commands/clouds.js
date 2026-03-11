@@ -17,7 +17,10 @@ import {
   verifyProject,
 } from "../lib/clouds/gcp.js";
 import { verifyCredentials as awsVerify } from "../lib/clouds/aws.js";
-import { verifyCredentials as azureVerify } from "../lib/clouds/azure.js";
+import {
+  verifyCredentials as azureVerify,
+  parseResourceGroupInput,
+} from "../lib/clouds/azure.js";
 import kleur from "kleur";
 
 function prompt(rl, question) {
@@ -417,38 +420,64 @@ async function authAzure(rl) {
     if (!subscriptionId) fatal("No subscription ID provided.");
   }
 
-  var resourceGroup = await prompt(rl, "Resource group [relight]: ");
-  resourceGroup = (resourceGroup || "").trim() || "relight";
+  var resourceGroupInput = await prompt(rl, "Resource group name or ID [relight]: ");
+  var resourceGroupRef;
+  try {
+    resourceGroupRef = parseResourceGroupInput(subscriptionId, resourceGroupInput);
+  } catch (e) {
+    fatal(e.message);
+  }
+  subscriptionId = resourceGroupRef.subscriptionId;
+
+  var useExistingResourceGroup = resourceGroupRef.isFullId;
+  if (!resourceGroupRef.isFullId) {
+    var existingOnly = await prompt(rl, "Use existing resource group only? [y/N]: ");
+    useExistingResourceGroup = !!existingOnly.match(/^y(es)?$/i);
+  }
 
   var location = await prompt(rl, "Default location [eastus]: ");
   location = (location || "").trim() || "eastus";
 
   process.stderr.write("\nVerifying...\n");
   try {
-    await azureVerify(tenantId, clientId, clientSecret, subscriptionId);
+    await azureVerify(tenantId, clientId, clientSecret, subscriptionId, {
+      resourceGroupId: resourceGroupRef.resourceGroupId,
+      existingOnly: useExistingResourceGroup,
+    });
   } catch (e) {
     fatal("Credential verification failed.", e.message);
   }
 
-  // Ensure resource group exists
-  try {
-    var { azureApi, mintAccessToken } = await import("../lib/clouds/azure.js");
-    var token = await mintAccessToken(tenantId, clientId, clientSecret);
-    await azureApi("PUT", `/subscriptions/${subscriptionId}/resourceGroups/${resourceGroup}`, {
-      location,
-    }, token);
-  } catch (e) {
-    // Non-fatal - resource group may already exist
-    if (!e.message.includes("already exists") && !e.message.includes("200")) {
-      process.stderr.write(`  ${fmt.dim(`Note: Could not create resource group: ${e.message}`)}\n`);
+  if (!useExistingResourceGroup) {
+    try {
+      var { azureApi, mintAccessToken } = await import("../lib/clouds/azure.js");
+      var token = await mintAccessToken(tenantId, clientId, clientSecret);
+      await azureApi("PUT", resourceGroupRef.resourceGroupId, {
+        location,
+      }, token);
+    } catch (e) {
+      if (!e.message.includes("already exists") && !e.message.includes("200")) {
+        process.stderr.write(`  ${fmt.dim(`Note: Could not create resource group: ${e.message}`)}\n`);
+      }
     }
   }
 
   process.stderr.write(`  Subscription: ${fmt.bold(subscriptionId)}\n`);
-  process.stderr.write(`  Resource group: ${fmt.bold(resourceGroup)}\n`);
+  process.stderr.write(`  Resource group: ${fmt.bold(resourceGroupRef.resourceGroup)}\n`);
+  if (useExistingResourceGroup) {
+    process.stderr.write(`  ${fmt.dim("Using existing resource group (no create attempt)")}\n`);
+  }
   process.stderr.write(`  Location: ${fmt.bold(location)}\n`);
 
-  return { tenantId, clientId, clientSecret, subscriptionId, resourceGroup, location };
+  return {
+    tenantId,
+    clientId,
+    clientSecret,
+    subscriptionId,
+    resourceGroup: resourceGroupRef.resourceGroup,
+    resourceGroupId: resourceGroupRef.isFullId ? resourceGroupRef.resourceGroupId : undefined,
+    location,
+  };
 }
 
 // --- Helpers ---

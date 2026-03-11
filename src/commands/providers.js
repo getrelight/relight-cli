@@ -22,7 +22,10 @@ import {
   verifyProject,
 } from "../lib/clouds/gcp.js";
 import { verifyCredentials as awsVerify } from "../lib/clouds/aws.js";
-import { verifyCredentials as azureVerify } from "../lib/clouds/azure.js";
+import {
+  verifyCredentials as azureVerify,
+  parseResourceGroupInput,
+} from "../lib/clouds/azure.js";
 import { verifyConnection } from "../lib/clouds/slicervm.js";
 import { verifyApiKey } from "../lib/clouds/neon.js";
 import { verifyApiToken as verifyTursoToken } from "../lib/clouds/turso.js";
@@ -459,10 +462,10 @@ async function authGHCR(rl) {
 
   var owner;
   if (detectedOwner) {
-    var ownerInput = await prompt(rl, `Package owner/namespace [${detectedOwner}]: `);
+    var ownerInput = await prompt(rl, `Package namespace/prefix [${detectedOwner}]: `);
     owner = (ownerInput || "").trim() || detectedOwner;
   } else {
-    owner = await prompt(rl, "Package owner/namespace: ");
+    owner = await prompt(rl, "Package namespace/prefix (e.g. owner or owner/team): ");
     owner = (owner || "").trim();
     if (!owner) fatal("No package owner provided.");
   }
@@ -489,12 +492,12 @@ async function authGHCR(rl) {
 
   process.stderr.write("\nVerifying...\n");
   try {
-    await verifyGHCR(username, token);
+    await verifyGHCR(username, token, owner);
   } catch (e) {
     fatal("Credential verification failed.", e.message);
   }
 
-  process.stderr.write(`  Namespace: ${fmt.bold(owner)}\n`);
+  process.stderr.write(`  Namespace: ${fmt.bold(owner)} ${fmt.dim("(app name is appended automatically)")}\n`);
   process.stderr.write(`  Username: ${fmt.bold(username)}\n`);
 
   return { owner, username, token };
@@ -558,36 +561,64 @@ async function authAzure(rl) {
     if (!subscriptionId) fatal("No subscription ID provided.");
   }
 
-  var resourceGroup = await prompt(rl, "Resource group [relight]: ");
-  resourceGroup = (resourceGroup || "").trim() || "relight";
+  var resourceGroupInput = await prompt(rl, "Resource group name or ID [relight]: ");
+  var resourceGroupRef;
+  try {
+    resourceGroupRef = parseResourceGroupInput(subscriptionId, resourceGroupInput);
+  } catch (e) {
+    fatal(e.message);
+  }
+  subscriptionId = resourceGroupRef.subscriptionId;
+
+  var useExistingResourceGroup = resourceGroupRef.isFullId;
+  if (!resourceGroupRef.isFullId) {
+    var existingOnly = await prompt(rl, "Use existing resource group only? [y/N]: ");
+    useExistingResourceGroup = !!existingOnly.match(/^y(es)?$/i);
+  }
 
   var location = await prompt(rl, "Default location [eastus]: ");
   location = (location || "").trim() || "eastus";
 
   process.stderr.write("\nVerifying...\n");
   try {
-    await azureVerify(tenantId, clientId, clientSecret, subscriptionId);
+    await azureVerify(tenantId, clientId, clientSecret, subscriptionId, {
+      resourceGroupId: resourceGroupRef.resourceGroupId,
+      existingOnly: useExistingResourceGroup,
+    });
   } catch (e) {
     fatal("Credential verification failed.", e.message);
   }
 
-  try {
-    var { azureApi, mintAccessToken } = await import("../lib/clouds/azure.js");
-    var token = await mintAccessToken(tenantId, clientId, clientSecret);
-    await azureApi("PUT", `/subscriptions/${subscriptionId}/resourceGroups/${resourceGroup}`, {
-      location,
-    }, token);
-  } catch (e) {
-    if (!e.message.includes("already exists") && !e.message.includes("200")) {
-      process.stderr.write(`  ${fmt.dim(`Note: Could not create resource group: ${e.message}`)}\n`);
+  if (!useExistingResourceGroup) {
+    try {
+      var { azureApi, mintAccessToken } = await import("../lib/clouds/azure.js");
+      var token = await mintAccessToken(tenantId, clientId, clientSecret);
+      await azureApi("PUT", resourceGroupRef.resourceGroupId, {
+        location,
+      }, token);
+    } catch (e) {
+      if (!e.message.includes("already exists") && !e.message.includes("200")) {
+        process.stderr.write(`  ${fmt.dim(`Note: Could not create resource group: ${e.message}`)}\n`);
+      }
     }
   }
 
   process.stderr.write(`  Subscription: ${fmt.bold(subscriptionId)}\n`);
-  process.stderr.write(`  Resource group: ${fmt.bold(resourceGroup)}\n`);
+  process.stderr.write(`  Resource group: ${fmt.bold(resourceGroupRef.resourceGroup)}\n`);
+  if (useExistingResourceGroup) {
+    process.stderr.write(`  ${fmt.dim("Using existing resource group (no create attempt)")}\n`);
+  }
   process.stderr.write(`  Location: ${fmt.bold(location)}\n`);
 
-  return { tenantId, clientId, clientSecret, subscriptionId, resourceGroup, location };
+  return {
+    tenantId,
+    clientId,
+    clientSecret,
+    subscriptionId,
+    resourceGroup: resourceGroupRef.resourceGroup,
+    resourceGroupId: resourceGroupRef.isFullId ? resourceGroupRef.resourceGroupId : undefined,
+    location,
+  };
 }
 
 async function authSlicerVM(rl) {

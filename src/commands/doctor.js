@@ -238,25 +238,17 @@ async function checkAzure(cfg) {
 
   if (token) {
     ok =
-      (await asyncCheck("Subscription accessible", async () => {
-        var { azureApi } = await import("../lib/clouds/azure.js");
-        await azureApi("GET", `/subscriptions/${cfg.subscriptionId}/resourcegroups`, null, token);
+      (await asyncCheck("Resource group accessible", async () => {
+        var { azureApi, rgPath } = await import("../lib/clouds/azure.js");
+        await azureApi("GET", rgPath(cfg), null, token);
       })) && ok;
 
     ok =
       (await asyncCheck("Container Apps accessible", async () => {
-        var { azureApi } = await import("../lib/clouds/azure.js");
+        var { azureApi, rgPath } = await import("../lib/clouds/azure.js");
         await azureApi("GET",
-          `/subscriptions/${cfg.subscriptionId}/resourceGroups/${cfg.resourceGroup}/providers/Microsoft.App/containerApps`,
+          `${rgPath(cfg)}/providers/Microsoft.App/containerApps`,
           null, token, { apiVersion: "2024-03-01" });
-      })) && ok;
-
-    ok =
-      (await asyncCheck("Container Registry accessible", async () => {
-        var { azureApi } = await import("../lib/clouds/azure.js");
-        await azureApi("GET",
-          `/subscriptions/${cfg.subscriptionId}/resourceGroups/${cfg.resourceGroup}/providers/Microsoft.ContainerRegistry/registries`,
-          null, token, { apiVersion: "2023-07-01" });
       })) && ok;
   }
 

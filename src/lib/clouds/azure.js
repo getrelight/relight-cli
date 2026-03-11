@@ -123,9 +123,22 @@ export async function pollOperation(method, path, body, token, opts) {
   throw new Error("Timed out waiting for Azure operation to complete.");
 }
 
-export async function verifyCredentials(tenantId, clientId, clientSecret, subscriptionId) {
+export async function verifyCredentials(
+  tenantId,
+  clientId,
+  clientSecret,
+  subscriptionId,
+  opts = {}
+) {
   var token = await mintAccessToken(tenantId, clientId, clientSecret);
-  // Verify by listing resource groups
+
+  // When an existing RG is provided, verify access at RG scope only.
+  if (opts.resourceGroupId && opts.existingOnly) {
+    await azureApi("GET", opts.resourceGroupId, null, token);
+    return token;
+  }
+
+  // Otherwise verify by listing resource groups in the subscription.
   await azureApi("GET", `/subscriptions/${subscriptionId}/resourcegroups`, null, token);
   return token;
 }
@@ -136,5 +149,33 @@ export async function getToken(cfg) {
 
 // Resource group path helper
 export function rgPath(cfg) {
+  if (cfg.resourceGroupId) return cfg.resourceGroupId;
   return `/subscriptions/${cfg.subscriptionId}/resourceGroups/${cfg.resourceGroup}`;
+}
+
+export function parseResourceGroupInput(subscriptionId, input) {
+  var value = (input || "").trim().replace(/\/+$/, "");
+  if (!value) value = "relight";
+
+  if (value.startsWith("/subscriptions/")) {
+    var match = value.match(/^\/subscriptions\/([^/]+)\/resourceGroups\/([^/]+)$/i);
+    if (!match) {
+      throw new Error(
+        "Invalid resource group ID. Expected /subscriptions/<id>/resourceGroups/<name>."
+      );
+    }
+    return {
+      subscriptionId: match[1],
+      resourceGroup: match[2],
+      resourceGroupId: `/subscriptions/${match[1]}/resourceGroups/${match[2]}`,
+      isFullId: true,
+    };
+  }
+
+  return {
+    subscriptionId,
+    resourceGroup: value,
+    resourceGroupId: `/subscriptions/${subscriptionId}/resourceGroups/${value}`,
+    isFullId: false,
+  };
 }
