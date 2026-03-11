@@ -329,6 +329,15 @@ export async function deleteDnsRecord(accountId, apiToken, zoneId, recordId) {
   );
 }
 
+export async function updateDnsRecord(accountId, apiToken, zoneId, recordId, record) {
+  return cfApi(
+    "PUT",
+    `/zones/${zoneId}/dns_records/${recordId}`,
+    record,
+    apiToken
+  );
+}
+
 // --- Workers custom domains ---
 
 export async function addWorkerDomain(accountId, apiToken, scriptName, hostname, zoneId) {

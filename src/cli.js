@@ -46,7 +46,7 @@ providersCmd
 
 providersCmd
   .command("add [type]")
-  .description("Add a provider (cf, gcp, aws, azure, slicervm, neon, turso)")
+  .description("Add a provider (cf, gcp, aws, azure, ghcr, slicervm, neon, turso)")
   .action(providersAdd);
 
 providersCmd
@@ -65,6 +65,7 @@ program
   .command("deploy [name] [path]")
   .description("Deploy an app from a Dockerfile (name auto-generated if omitted)")
   .option("--compute <name>", "Provider for compute")
+  .option("--registry <name>", "Provider for container registry")
   .option("-t, --tag <tag>", "Image tag (default: deploy-<timestamp>)")
   .option("-e, --env <vars...>", "Set env vars (KEY=VALUE)")
   .option(

@@ -11,6 +11,7 @@ import { verifyToken as cfVerify, getWorkersSubdomain } from "../lib/clouds/cf.j
 import { mintAccessToken, verifyProject as gcpVerifyProject, listAllServices as gcpListServices, gcpApi, AR_API, SQLADMIN_API, DNS_API } from "../lib/clouds/gcp.js";
 import { verifyCredentials as awsVerify, checkAppRunner, awsJsonApi, awsQueryApi, awsRestXmlApi } from "../lib/clouds/aws.js";
 import { verifyConnection as slicerVerify } from "../lib/clouds/slicervm.js";
+import { verifyCredentials as ghcrVerify } from "../lib/clouds/ghcr.js";
 import kleur from "kleur";
 
 var PASS = kleur.green("[ok]");
@@ -74,6 +75,9 @@ export async function doctor() {
         break;
       case "azure":
         allGood = (await checkAzure(cfg)) && allGood;
+        break;
+      case "ghcr":
+        allGood = (await checkGHCR(cfg)) && allGood;
         break;
       case "slicervm":
         allGood =
@@ -234,27 +238,30 @@ async function checkAzure(cfg) {
 
   if (token) {
     ok =
-      (await asyncCheck("Subscription accessible", async () => {
-        var { azureApi } = await import("../lib/clouds/azure.js");
-        await azureApi("GET", `/subscriptions/${cfg.subscriptionId}/resourcegroups`, null, token);
+      (await asyncCheck("Resource group accessible", async () => {
+        var { azureApi, rgPath } = await import("../lib/clouds/azure.js");
+        await azureApi("GET", rgPath(cfg), null, token);
       })) && ok;
 
     ok =
       (await asyncCheck("Container Apps accessible", async () => {
-        var { azureApi } = await import("../lib/clouds/azure.js");
+        var { azureApi, rgPath } = await import("../lib/clouds/azure.js");
         await azureApi("GET",
-          `/subscriptions/${cfg.subscriptionId}/resourceGroups/${cfg.resourceGroup}/providers/Microsoft.App/containerApps`,
+          `${rgPath(cfg)}/providers/Microsoft.App/containerApps`,
           null, token, { apiVersion: "2024-03-01" });
       })) && ok;
-
-    ok =
-      (await asyncCheck("Container Registry accessible", async () => {
-        var { azureApi } = await import("../lib/clouds/azure.js");
-        await azureApi("GET",
-          `/subscriptions/${cfg.subscriptionId}/resourceGroups/${cfg.resourceGroup}/providers/Microsoft.ContainerRegistry/registries`,
-          null, token, { apiVersion: "2023-07-01" });
-      })) && ok;
   }
+
+  return ok;
+}
+
+async function checkGHCR(cfg) {
+  var ok = true;
+
+  ok =
+    (await asyncCheck("Registry credentials valid", async () => {
+      await ghcrVerify(cfg.username, cfg.token);
+    })) && ok;
 
   return ok;
 }

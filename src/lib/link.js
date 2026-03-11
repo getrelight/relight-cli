@@ -13,12 +13,13 @@ export function readLink() {
   }
 }
 
-export function linkApp(name, compute, dns, db, dbProvider) {
+export function linkApp(name, compute, dns, db, dbProvider, registry) {
   var data = { app: name };
   if (compute) data.compute = compute;
   if (dns && dns !== compute) data.dns = dns;
   if (db) data.db = db;
   if (dbProvider) data.dbProvider = dbProvider;
+  if (registry && registry !== compute) data.registry = registry;
   writeFileSync(LINK_FILE, YAML.stringify(data));
 }
 

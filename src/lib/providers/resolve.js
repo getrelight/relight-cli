@@ -49,7 +49,7 @@ function resolveProviderName(options, layer) {
   // 2. .relight.yaml
   var linked = readLink();
   if (layer === "app" && linked?.compute) return linked.compute;
-  if (layer === "registry" && linked?.compute) return linked.compute;
+  if (layer === "registry" && linked?.registry) return linked.registry;
   if (layer === "dns") {
     if (linked?.dns) return linked.dns;
     if (linked?.compute) return linked.compute;
@@ -60,6 +60,7 @@ function resolveProviderName(options, layer) {
   var defaultName = getDefault(layer);
   if (defaultName) return defaultName;
   if (layer === "registry") {
+    if (linked?.compute) return linked.compute;
     defaultName = getDefault("app");
     if (defaultName) return defaultName;
   }

@@ -12,6 +12,7 @@ export var PROVIDERS = {
   gcp: { name: "Google Cloud", layers: ["app", "db", "dns", "registry"] },
   aws: { name: "AWS", layers: ["app", "db", "dns", "registry"] },
   azure: { name: "Azure", layers: ["app", "db", "dns", "registry"] },
+  ghcr: { name: "GitHub Container Registry", layers: ["registry"] },
   neon: { name: "Neon", layers: ["db"] },
   turso: { name: "Turso", layers: ["db"] },
   slicervm: { name: "SlicerVM", layers: ["app"] },

@@ -33,6 +33,13 @@ var AWS_PRICING = {
   memGbHr: 0.007,
 };
 
+// --- Azure Container Apps pricing (rough consumption estimate) ---
+
+var AZURE_PRICING = {
+  vcpuHr: 0.0864,
+  memGbHr: 0.0108,
+};
+
 // --- Date range parsing ---
 
 function parseDateRange(since) {
@@ -377,6 +384,14 @@ function calculateAwsAppCosts(usage) {
   return { activeCost, provisionedCost, memCost, total: activeCost + provisionedCost + memCost };
 }
 
+// --- Azure cost calculation ---
+
+function calculateAzureAppCosts(usage) {
+  var vcpuCost = usage.provisionedVcpuHrs * AZURE_PRICING.vcpuHr;
+  var memCost = usage.memGbHrs * AZURE_PRICING.memGbHr;
+  return { vcpuCost, memCost, total: vcpuCost + memCost };
+}
+
 // --- Render AWS single app ---
 
 function renderAwsSingleApp(app, range) {
@@ -450,6 +465,83 @@ function renderAwsFleet(appResults, range) {
   );
   console.log("");
   console.log(fmt.dim("  Estimates based on AWS App Runner pricing (min 1 provisioned instance)."));
+  console.log("");
+}
+
+// --- Azure single app ---
+
+function renderAzureSingleApp(app, range) {
+  var costs = calculateAzureAppCosts(app.usage);
+
+  console.log("");
+  console.log(
+    `  ${fmt.bold("Estimated cost for")} ${fmt.app(app.name)} ${fmt.dim(`(${range.label})`)}`
+  );
+  console.log("");
+
+  var header = "  COMPONENT      USAGE                 ESTIMATED COST";
+  var sep = "  " + "-".repeat(50);
+
+  console.log(fmt.bold(header));
+  console.log(fmt.dim(sep));
+
+  var rows = [
+    ["vCPU", app.usage.provisionedVcpuHrs.toFixed(1) + " vCPU-hrs", fmtCost(costs.vcpuCost)],
+    ["Memory", app.usage.memGbHrs.toFixed(1) + " GiB-hrs", fmtCost(costs.memCost)],
+  ];
+
+  for (var row of rows) {
+    var comp = row[0] ? fmt.bold(row[0].padEnd(14)) : " ".repeat(14);
+    var usage = row[1].padEnd(22);
+    console.log(`  ${comp} ${usage} ${row[2]}`);
+  }
+
+  console.log(fmt.dim(sep));
+  console.log(
+    `  ${" ".repeat(14)} ${"".padEnd(22)} ${fmt.bold(fmtCost(costs.total))}`
+  );
+  console.log("");
+  console.log(
+    fmt.dim("  Rough estimate based on configured Azure Container Apps resources over the selected period.")
+  );
+  console.log("");
+}
+
+// --- Azure fleet ---
+
+function renderAzureFleet(appResults, range) {
+  console.log("");
+  console.log(
+    `  ${fmt.bold("Estimated costs")} ${fmt.dim(`(${range.label})`)}`
+  );
+  console.log("");
+
+  var headers = ["NAME", "VCPU", "MEMORY", "TOTAL"];
+  var rows = appResults.map((a) => {
+    var costs = calculateAzureAppCosts(a.usage);
+    return [
+      fmt.app(a.name),
+      fmtCost(costs.vcpuCost),
+      fmtCost(costs.memCost),
+      fmtCost(costs.total),
+    ];
+  });
+
+  console.log(table(headers, rows));
+  console.log("");
+
+  var grandTotal = appResults.reduce((sum, a) => sum + calculateAzureAppCosts(a.usage).total, 0);
+  var labelW = 44;
+  console.log("  " + fmt.dim("-".repeat(labelW + 8)));
+  console.log(
+    "  " +
+      fmt.bold("TOTAL".padEnd(labelW)) +
+      fmt.bold(fmtCost(grandTotal))
+  );
+  console.log("");
+  console.log(
+    fmt.dim("  Rough estimates based on configured Azure Container Apps resources over the selected period.")
+  );
   console.log("");
 }
 
@@ -542,6 +634,40 @@ export async function cost(name, options) {
       renderGcpSingleApp(appResults[0], range);
     } else {
       renderGcpFleet(appResults, range);
+    }
+    return;
+  }
+
+  if (stack.app.type === "azure") {
+    if (options.json) {
+      var jsonOut = singleApp
+        ? {
+            app: appResults[0].name,
+            period: range.label,
+            since: range.sinceISO,
+            until: range.untilISO,
+            usage: appResults[0].usage,
+            costs: calculateAzureAppCosts(appResults[0].usage),
+          }
+        : {
+            period: range.label,
+            since: range.sinceISO,
+            until: range.untilISO,
+            apps: appResults.map((a) => ({
+              name: a.name,
+              usage: a.usage,
+              costs: calculateAzureAppCosts(a.usage),
+            })),
+            total: appResults.reduce((s, a) => s + calculateAzureAppCosts(a.usage).total, 0),
+          };
+      console.log(JSON.stringify(jsonOut, null, 2));
+      return;
+    }
+
+    if (singleApp) {
+      renderAzureSingleApp(appResults[0], range);
+    } else {
+      renderAzureFleet(appResults, range);
     }
     return;
   }

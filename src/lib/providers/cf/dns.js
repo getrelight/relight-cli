@@ -3,6 +3,7 @@ import {
   findZoneForHostname,
   listDnsRecords,
   createDnsRecord,
+  updateDnsRecord,
   deleteDnsRecord,
   addWorkerDomain,
   removeWorkerDomain,
@@ -108,22 +109,56 @@ export async function removeDomain(cfg, appName, domain) {
 // --- Pure DNS record operations (for cross-cloud use) ---
 
 export async function addDnsRecord(cfg, domain, target, zone, opts = {}) {
+  var type = opts.type || "CNAME";
+  var proxied = opts.proxied !== undefined ? opts.proxied : true;
+
   // Check for existing records
   var existing = await listDnsRecords(cfg.accountId, cfg.apiToken, zone.id, { name: domain });
   if (existing.length > 0) {
+    var normalizedTarget =
+      type === "CNAME"
+        ? String(target).replace(/\.$/, "").toLowerCase()
+        : String(target);
+    var matching = existing.filter(
+      (r) =>
+        r.type === type &&
+        (type === "CNAME"
+          ? String(r.content).replace(/\.$/, "").toLowerCase() === normalizedTarget
+          : String(r.content) === normalizedTarget)
+    );
+
+    // Idempotent success: the desired record already exists.
+    if (matching.length > 0 && matching.length === existing.length) {
+      if (type === "CNAME") {
+        var needsProxyUpdate = matching.some((r) => !!r.proxied !== !!proxied);
+        if (needsProxyUpdate) {
+          for (var record of matching) {
+            await updateDnsRecord(cfg.accountId, cfg.apiToken, zone.id, record.id, {
+              type,
+              name: domain,
+              content: target,
+              proxied,
+            });
+          }
+          return { created: false, updated: true };
+        }
+      }
+      return { created: false, existing: true };
+    }
+
     var types = existing.map((r) => `${r.type} -> ${r.content}`).join("\n  ");
     throw new Error(
       `DNS record already exists for ${domain}.\nExisting records:\n  ${types}\n\nRemove the existing record first, or choose a different domain.`
     );
   }
 
-  var proxied = opts.proxied !== undefined ? opts.proxied : true;
   await createDnsRecord(cfg.accountId, cfg.apiToken, zone.id, {
-    type: "CNAME",
+    type,
     name: domain,
     content: target,
-    proxied,
+    proxied: type === "CNAME" ? proxied : undefined,
   });
+  return { created: true };
 }
 
 export async function removeDnsRecord(cfg, domain) {

@@ -27,13 +27,15 @@ export async function deploy(nameOrPath, path, options) {
   var hasRegistry = PROVIDERS[providerType].layers.includes("registry");
 
   // Get registry credentials and image tag (only for providers with registry)
-  var registry, remoteTag;
+  var registry, registryName, registryCfg, registryCreds, remoteTag;
   var localTag = `relight-${name}:${tag}`;
 
   if (hasRegistry) {
     var registryStack = await resolveStack(options, ["registry"]);
+    registryName = registryStack.registry.name;
+    registryCfg = registryStack.registry.cfg;
     registry = registryStack.registry.provider;
-    remoteTag = await registry.getImageTag(registryStack.registry.cfg, name, tag);
+    remoteTag = await registry.getImageTag(registryCfg, name, tag);
   }
 
   // Load existing config from deployed worker (null on first deploy)
@@ -212,9 +214,8 @@ export async function deploy(nameOrPath, path, options) {
     // 2. Push to registry
     phase("Pushing to registry");
     status("Authenticating...");
-    var registryCfg = (await resolveStack(options, ["registry"])).registry.cfg;
-    var creds = await registry.getCredentials(registryCfg);
-    dockerLogin(creds.registry, creds.username, creds.password);
+    registryCreds = await registry.getCredentials(registryCfg);
+    dockerLogin(registryCreds.registry, registryCreds.username, registryCreds.password);
     if (registry.ensureRepository) await registry.ensureRepository(registryCfg, name);
     status(`Pushing ${remoteTag}...`);
     dockerTag(localTag, remoteTag);
@@ -226,6 +227,8 @@ export async function deploy(nameOrPath, path, options) {
       appConfig,
       isFirstDeploy,
       newSecrets,
+      registryName,
+      registryCredentials: registryCreds,
     });
   }
 
@@ -254,5 +257,13 @@ export async function deploy(nameOrPath, path, options) {
   }
 
   // Link this directory to the app
-  linkApp(name, providerName, options.dns);
+  var linked = readLink();
+  linkApp(
+    name,
+    providerName,
+    options.dns || linked?.dns,
+    linked?.db,
+    linked?.dbProvider,
+    registryName || linked?.registry
+  );
 }
