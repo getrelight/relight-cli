@@ -8,7 +8,8 @@
   "type": "module",
   "exports": {
     ".": "./src/cli.js",
-    "./worker-template": "./worker-template/src/index.js"
+    "./worker-template": "./worker-template/src/index.js",
+    "./src/*": "./src/*"
   },
   "license": "MIT",
   "files": [

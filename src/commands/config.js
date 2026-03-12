@@ -1,9 +1,50 @@
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import { status, success, fatal, hint, fmt } from "../lib/output.js";
-import { resolveAppName } from "../lib/link.js";
+import { resolveAppName, readLink } from "../lib/link.js";
 import { resolveStack } from "../lib/providers/resolve.js";
 
 var RESERVED_NAMES = ["RELIGHT_APP_CONFIG", "APP_CONTAINER", "DB", "DB_URL", "DB_TOKEN"];
+
+var ENV_RELIGHT = ".env.relight";
+
+function captureToEnvRelight(secrets) {
+  // Read existing .env.relight and update/append keys
+  var existing = {};
+  if (existsSync(ENV_RELIGHT)) {
+    for (var line of readFileSync(ENV_RELIGHT, "utf-8").split("\n")) {
+      var trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      var eq = trimmed.indexOf("=");
+      if (eq !== -1) existing[trimmed.substring(0, eq)] = trimmed.substring(eq + 1);
+    }
+  }
+
+  for (var [key, value] of Object.entries(secrets)) {
+    existing[key] = value;
+  }
+
+  var lines = ["# .env.relight - production secrets captured by relight", "# Add to .gitignore. Do not share.", ""];
+  for (var [k, v] of Object.entries(existing)) {
+    lines.push(`${k}=${v}`);
+  }
+  writeFileSync(ENV_RELIGHT, lines.join("\n") + "\n");
+
+  // Auto-add to .gitignore
+  ensureGitignore(ENV_RELIGHT);
+
+  status(fmt.dim(`Secrets captured to ${ENV_RELIGHT}`));
+}
+
+function ensureGitignore(entry) {
+  var gitignore = ".gitignore";
+  if (existsSync(gitignore)) {
+    var content = readFileSync(gitignore, "utf-8");
+    if (content.includes(entry)) return;
+    appendFileSync(gitignore, `\n${entry}\n`);
+  } else {
+    writeFileSync(gitignore, `${entry}\n`);
+  }
+}
 
 function validateKeyName(key) {
   if (RESERVED_NAMES.includes(key)) {
@@ -109,6 +150,15 @@ export async function configSet(args, options) {
   }
 
   await appProvider.pushAppConfig(cfg, name, appConfig, { newSecrets: Object.keys(newSecrets).length > 0 ? newSecrets : undefined });
+
+  // Capture secrets to .env.relight if captureSecrets is enabled
+  if (isSecret && Object.keys(newSecrets).length > 0) {
+    var link = readLink();
+    if (link && link.captureSecrets) {
+      captureToEnvRelight(newSecrets);
+    }
+  }
+
   success("Config updated (live).");
 }
 
@@ -273,5 +323,14 @@ export async function configImport(name, options) {
   }
 
   await appProvider.pushAppConfig(cfg, name, appConfig, { newSecrets: Object.keys(newSecrets).length > 0 ? newSecrets : undefined });
+
+  // Capture secrets to .env.relight if captureSecrets is enabled
+  if (isSecret && Object.keys(newSecrets).length > 0) {
+    var link = readLink();
+    if (link && link.captureSecrets) {
+      captureToEnvRelight(newSecrets);
+    }
+  }
+
   success(`${count} variable${count !== 1 ? "s" : ""} imported (live).`);
 }

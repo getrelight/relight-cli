@@ -2,14 +2,48 @@ import { phase, status, success, fatal, hint, fmt, table } from "../lib/output.j
 import { resolveAppName, readLink, linkApp } from "../lib/link.js";
 import { resolveStack } from "../lib/providers/resolve.js";
 import { createInterface } from "readline";
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, statSync, existsSync, appendFileSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 
 // --- Helpers ---
+
+function captureToEnvRelight(secrets) {
+  var envFile = ".env.relight";
+  var existing = {};
+  if (existsSync(envFile)) {
+    for (var line of readFileSync(envFile, "utf-8").split("\n")) {
+      var trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      var eq = trimmed.indexOf("=");
+      if (eq !== -1) existing[trimmed.substring(0, eq)] = trimmed.substring(eq + 1);
+    }
+  }
+  for (var [key, value] of Object.entries(secrets)) {
+    existing[key] = value;
+  }
+  var lines = ["# .env.relight - production secrets captured by relight", "# Add to .gitignore. Do not share.", ""];
+  for (var [k, v] of Object.entries(existing)) {
+    lines.push(`${k}=${v}`);
+  }
+  writeFileSync(envFile, lines.join("\n") + "\n");
+
+  // Auto-add to .gitignore
+  var gitignore = ".gitignore";
+  if (existsSync(gitignore)) {
+    var content = readFileSync(gitignore, "utf-8");
+    if (!content.includes(envFile)) appendFileSync(gitignore, `\n${envFile}\n`);
+  } else {
+    writeFileSync(gitignore, `${envFile}\n`);
+  }
+
+  status(fmt.dim(`Secrets captured to ${envFile}`));
+}
 
 function resolveDatabase(name, options) {
   if (!name) {
     var linked = readLink();
-    name = linked?.db;
+    name = linked?.app;
   }
   if (!name) fatal("No database specified.");
   return name;
@@ -38,10 +72,10 @@ export async function dbCreate(name, options) {
     fatal(e.message);
   }
 
-  // Update .relight.yaml with db + dbProvider
+  // Update .relight.yaml with db provider
   var linked = readLink();
   if (linked) {
-    linkApp(linked.app, linked.compute, linked.dns, name, providerName, linked.registry);
+    linkApp(linked.app, linked.compute, linked.dns, providerName, linked.registry);
   }
 
   if (options.json) {
@@ -167,19 +201,16 @@ export async function dbAttach(name, appName, options) {
   if (!appConfig.secretKeys) appConfig.secretKeys = [];
   if (!appConfig.env) appConfig.env = {};
 
-  // Inject env vars based on provider type
+  // Inject env vars - DATABASE_URL as secret (contains password)
   var newSecrets = {};
+  var urlKey = creds.isPostgres ? "DATABASE_URL" : "DB_URL";
 
-  if (creds.isPostgres) {
-    if (creds.connectionUrl) {
-      appConfig.env["DATABASE_URL"] = creds.connectionUrl;
-      if (!appConfig.envKeys.includes("DATABASE_URL")) appConfig.envKeys.push("DATABASE_URL");
-    }
-  } else {
-    if (creds.connectionUrl) {
-      appConfig.env["DB_URL"] = creds.connectionUrl;
-      if (!appConfig.envKeys.includes("DB_URL")) appConfig.envKeys.push("DB_URL");
-    }
+  if (creds.connectionUrl) {
+    appConfig.env[urlKey] = "[hidden]";
+    appConfig.secretKeys = appConfig.secretKeys.filter((k) => k !== urlKey);
+    appConfig.secretKeys.push(urlKey);
+    appConfig.envKeys = appConfig.envKeys.filter((k) => k !== urlKey);
+    newSecrets[urlKey] = creds.connectionUrl;
   }
 
   if (creds.token) {
@@ -190,7 +221,7 @@ export async function dbAttach(name, appName, options) {
     newSecrets.DB_TOKEN = creds.token;
   }
 
-  // Set tracking env vars
+  // Set tracking env vars (non-secret)
   appConfig.env["RELIGHT_DB"] = name;
   if (!appConfig.envKeys.includes("RELIGHT_DB")) appConfig.envKeys.push("RELIGHT_DB");
   appConfig.env["RELIGHT_DB_PROVIDER"] = dbProviderName;
@@ -200,10 +231,15 @@ export async function dbAttach(name, appName, options) {
     newSecrets: Object.keys(newSecrets).length > 0 ? newSecrets : undefined,
   });
 
-  // Update .relight.yaml
+  // Capture secrets to .env.relight if captureSecrets is enabled
   var linked = readLink();
+  if (linked && linked.captureSecrets && Object.keys(newSecrets).length > 0) {
+    captureToEnvRelight(newSecrets);
+  }
+
+  // Update .relight.yaml with db provider
   if (linked && linked.app === appName) {
-    linkApp(linked.app, linked.compute, linked.dns, name, dbProviderName, linked.registry);
+    linkApp(linked.app, linked.compute, linked.dns, dbProviderName, linked.registry);
   }
 
   success(`Database ${fmt.app(name)} attached to ${fmt.app(appName)}.`);
@@ -572,4 +608,221 @@ export async function dbReset(name, options) {
   }
 
   success(`Dropped ${tables.length} table${tables.length === 1 ? "" : "s"}.`);
+}
+
+// --- Backup helpers ---
+
+var BACKUPS_DIR = join(homedir(), ".relight", "backups");
+
+function backupDir(dbNameStr) {
+  return join(BACKUPS_DIR, dbNameStr);
+}
+
+function formatTimestamp() {
+  return new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+}
+
+function parseTimestamp(backupId) {
+  // 20260311T143022Z -> Date
+  var m = backupId.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+  if (!m) return null;
+  return new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`);
+}
+
+function formatAge(date) {
+  var seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (seconds < 60) return "just now";
+  var minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  var hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  var days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  var kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  var mb = kb / 1024;
+  return `${mb.toFixed(1)} MB`;
+}
+
+function listLocalBackups(name) {
+  var dir = backupDir(name);
+  if (!existsSync(dir)) return [];
+
+  var files = readdirSync(dir).filter((f) => f.endsWith(".sql")).sort().reverse();
+  return files.map((f) => {
+    var backupId = f.replace(/\.sql$/, "");
+    var filePath = join(dir, f);
+    var stat = statSync(filePath);
+    var ts = parseTimestamp(backupId);
+    return {
+      backupId,
+      path: filePath,
+      size: stat.size,
+      timestamp: ts ? ts.toISOString() : null,
+      date: ts,
+    };
+  });
+}
+
+// --- Backup commands ---
+
+export async function dbBackup(name, options) {
+  name = resolveDatabase(name, options);
+
+  var stack = await resolveStack(options, ["db"]);
+  var { cfg, provider, name: providerName } = stack.db;
+
+  phase("Backing up database");
+  status(`${name} (${providerName})...`);
+
+  var dump;
+  try {
+    dump = await provider.exportDatabase(cfg, name);
+  } catch (e) {
+    fatal(e.message);
+  }
+
+  var dir = backupDir(name);
+  mkdirSync(dir, { recursive: true });
+
+  var backupId = formatTimestamp();
+  var filePath = join(dir, `${backupId}.sql`);
+  writeFileSync(filePath, dump);
+
+  // Prune old backups if --keep specified
+  if (options.keep) {
+    var all = listLocalBackups(name);
+    var toDelete = all.slice(options.keep);
+    for (var b of toDelete) {
+      unlinkSync(b.path);
+    }
+  }
+
+  var backups = listLocalBackups(name);
+  var totalSize = backups.reduce((sum, b) => sum + b.size, 0);
+
+  if (options.json) {
+    console.log(JSON.stringify({
+      backupId,
+      database: name,
+      provider: providerName,
+      size: dump.length,
+      path: filePath,
+      totalBackups: backups.length,
+      totalSize,
+    }, null, 2));
+    return;
+  }
+
+  success(`Backup saved: ${fmt.bold(backupId)} (${formatSize(dump.length)})`);
+  status(`Location: ${filePath}`);
+  status(`Backups: ${backups.length} total (${formatSize(totalSize)})`);
+}
+
+export async function dbBackups(name, options) {
+  name = resolveDatabase(name, options);
+
+  var backups = listLocalBackups(name);
+
+  if (options.json) {
+    console.log(JSON.stringify(backups.map((b) => ({
+      backupId: b.backupId,
+      size: b.size,
+      timestamp: b.timestamp,
+    })), null, 2));
+    return;
+  }
+
+  if (backups.length === 0) {
+    console.log(fmt.dim(`\n  No backups for ${name}. Create one with: relight db backup ${name}\n`));
+    return;
+  }
+
+  var cols = ["BACKUP ID", "SIZE", "AGE"];
+  var rows = backups.map((b) => [
+    b.backupId,
+    formatSize(b.size),
+    b.date ? formatAge(b.date) : "-",
+  ]);
+
+  console.log(table(cols, rows));
+}
+
+export async function dbRestore(name, backupId, options) {
+  // Handle positional args: restore [name] [backupId]
+  // If only one arg and it looks like a timestamp, treat as backupId
+  if (name && /^\d{8}T\d{6}Z$/.test(name) && !backupId) {
+    backupId = name;
+    name = undefined;
+  }
+
+  name = resolveDatabase(name, options);
+
+  // If no backupId, use most recent
+  if (!backupId) {
+    var backups = listLocalBackups(name);
+    if (backups.length === 0) {
+      fatal(`No backups found for ${name}.`, `Create one with: relight db backup ${name}`);
+    }
+    backupId = backups[0].backupId;
+    status(`Using most recent backup: ${backupId}`);
+  }
+
+  var filePath = join(backupDir(name), `${backupId}.sql`);
+  if (!existsSync(filePath)) {
+    fatal(`Backup ${backupId} not found for ${name}.`, `Run: relight db backups ${name}`);
+  }
+
+  var sqlContent = readFileSync(filePath, "utf-8");
+
+  // Confirm
+  if (options.confirm !== name) {
+    if (process.stdin.isTTY) {
+      process.stderr.write(`\n  This will drop all tables in ${fmt.app(name)} and restore from ${fmt.bold(backupId)} (${formatSize(sqlContent.length)}).\n\n`);
+      var rl = createInterface({ input: process.stdin, output: process.stderr });
+      var answer = await new Promise((resolve) =>
+        rl.question(`  Type "${name}" to confirm: `, resolve)
+      );
+      rl.close();
+      if (answer.trim() !== name) {
+        fatal("Confirmation did not match. Aborting.");
+      }
+    } else {
+      fatal(
+        `Restoring database requires confirmation.`,
+        `Run: relight db restore ${name} ${backupId} --confirm ${name}`
+      );
+    }
+  }
+
+  var stack = await resolveStack(options, ["db"]);
+  var { cfg, provider } = stack.db;
+
+  phase("Restoring database");
+  status(`${name} from ${backupId}...`);
+
+  // Drop all tables first
+  status("Dropping existing tables...");
+  try {
+    var tables = await provider.resetDatabase(cfg, name);
+    if (tables.length > 0) {
+      status(`Dropped ${tables.length} table${tables.length === 1 ? "" : "s"}.`);
+    }
+  } catch (e) {
+    fatal(`Failed to reset database: ${e.message}`);
+  }
+
+  // Import backup
+  status("Importing backup...");
+  try {
+    await provider.importDatabase(cfg, name, sqlContent);
+  } catch (e) {
+    fatal(`Failed to import backup: ${e.message}`);
+  }
+
+  success(`Database ${fmt.app(name)} restored from ${fmt.bold(backupId)}.`);
 }

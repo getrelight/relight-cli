@@ -13,14 +13,24 @@ export function readLink() {
   }
 }
 
-export function linkApp(name, compute, dns, db, dbProvider, registry) {
+export function linkApp(name, compute, dns, dbProvider, registry) {
+  // Preserve existing settings (captureSecrets, preDeploy, etc.)
+  var existing = readLink() || {};
   var data = { app: name };
   if (compute) data.compute = compute;
   if (dns && dns !== compute) data.dns = dns;
-  if (db) data.db = db;
   if (dbProvider) data.dbProvider = dbProvider;
   if (registry && registry !== compute) data.registry = registry;
+  if (existing.captureSecrets) data.captureSecrets = existing.captureSecrets;
+  if (existing.preDeploy) data.preDeploy = existing.preDeploy;
   writeFileSync(LINK_FILE, YAML.stringify(data));
+}
+
+export function updateLink(updates) {
+  var existing = readLink();
+  if (!existing) return;
+  Object.assign(existing, updates);
+  writeFileSync(LINK_FILE, YAML.stringify(existing));
 }
 
 export function unlinkApp() {

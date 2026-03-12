@@ -8,14 +8,14 @@ var CONFIG_PATH = join(CONFIG_DIR, "config.json");
 export { CONFIG_DIR, CONFIG_PATH };
 
 export var PROVIDERS = {
-  cf: { name: "Cloudflare", layers: ["app", "db", "dns", "registry"] },
+  cf: { name: "Cloudflare", layers: ["app", "dns", "registry"] },
   gcp: { name: "Google Cloud", layers: ["app", "db", "dns", "registry"] },
   aws: { name: "AWS", layers: ["app", "db", "dns", "registry"] },
   azure: { name: "Azure", layers: ["app", "db", "dns", "registry"] },
+  do: { name: "DigitalOcean", layers: ["db", "dns"] },
   ghcr: { name: "GitHub Container Registry", layers: ["registry"] },
-  neon: { name: "Neon", layers: ["db"] },
-  turso: { name: "Turso", layers: ["db"] },
   slicervm: { name: "SlicerVM", layers: ["app"] },
+  demo: { name: "Demo (local)", layers: ["app", "db"] },
 };
 
 export var PROVIDER_TYPES = Object.keys(PROVIDERS);
@@ -178,6 +178,9 @@ export function normalizeProviderConfig(instance) {
 
   if (type === "cf") {
     return { accountId: rest.accountId, apiToken: rest.token };
+  }
+  if (type === "demo") {
+    return { url: rest.url || "http://localhost:9999", token: rest.token || "demo-token" };
   }
   if (type === "slicervm") {
     var cfg = { hostGroup: rest.hostGroup, baseDomain: rest.baseDomain };

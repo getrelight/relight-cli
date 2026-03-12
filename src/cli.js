@@ -21,6 +21,7 @@ import { cost } from "./commands/cost.js";
 import {
   dbCreate, dbDestroy, dbList, dbInfo, dbAttach, dbDetach,
   dbShell, dbQuery, dbImport, dbExport, dbToken, dbReset,
+  dbBackup, dbBackups, dbRestore,
 } from "./commands/db.js";
 import { fmt } from "./lib/output.js";
 import { createRequire } from "module";
@@ -46,7 +47,7 @@ providersCmd
 
 providersCmd
   .command("add [type]")
-  .description("Add a provider (cf, gcp, aws, azure, ghcr, slicervm, neon, turso)")
+  .description("Add a provider (cf, gcp, aws, azure, do, ghcr, slicervm)")
   .action(providersAdd);
 
 providersCmd
@@ -81,6 +82,9 @@ program
   .option("--disk <mb>", "Disk in MB (e.g. 2000, 5000)", parseInt)
   .option("--dns <name>", "Provider for DNS records")
   .option("--no-observability", "Disable Workers observability/logs")
+  .option("--db <name>", "Database provider (for --backup-db)")
+  .option("--pre-deploy <cmd>", "Run command in container before push (e.g. migrations)")
+  .option("--backup-db", "Backup database before deploying")
   .option("--json", "Output result as JSON")
   .option("-y, --yes", "Skip confirmation prompt")
   .action(deploy);
@@ -288,6 +292,29 @@ dbCmd
   .option("--confirm <name>", "Confirm by providing the database name")
   .action(dbReset);
 
+dbCmd
+  .command("backup [name]")
+  .description("Create a database backup (SQL dump)")
+  .option("--db <name>", "Database provider")
+  .option("--keep <n>", "Keep only N most recent backups", parseInt)
+  .option("--json", "Output as JSON")
+  .action(dbBackup);
+
+dbCmd
+  .command("backups [name]")
+  .description("List database backups")
+  .option("--db <name>", "Database provider")
+  .option("--json", "Output as JSON")
+  .action(dbBackups);
+
+dbCmd
+  .command("restore [name] [backupId]")
+  .description("Restore database from backup")
+  .option("--db <name>", "Database provider")
+  .option("--confirm <name>", "Confirm by providing the database name")
+  .option("--json", "Output as JSON")
+  .action(dbRestore);
+
 // --- PS ---
 
 program
@@ -349,6 +376,27 @@ program
   .option("--since <period>", "Date range: Nd (e.g. 7d) or YYYY-MM-DD (default: month to date)")
   .option("--json", "Output as JSON")
   .action(cost);
+
+// --- Portals ---
+
+import { portalsAdd, portalsList, portalsRemove } from "./commands/portals.js";
+
+var portalsCmd = program.command("portals").description("Manage portal connections");
+
+portalsCmd
+  .command("list", { isDefault: true })
+  .description("Show connected portal")
+  .action(portalsList);
+
+portalsCmd
+  .command("add <url>")
+  .description("Connect to a self-hosted Relight portal")
+  .action(portalsAdd);
+
+portalsCmd
+  .command("remove")
+  .description("Disconnect from portal")
+  .action(portalsRemove);
 
 // --- Doctor ---
 
