@@ -1,7 +1,10 @@
-// Azure REST API helpers using service principal auth (OAuth2 client credentials)
+// Azure REST API helpers - service principal auth (OAuth2 client credentials)
+// and managed/workload identity (Container Apps, VMs, App Service)
 
 var LOGIN_URL = "https://login.microsoftonline.com";
 var MGMT_URL = "https://management.azure.com";
+var MGMT_SCOPE = "https://management.azure.com/.default";
+var MGMT_RESOURCE = "https://management.azure.com";
 var API_VERSION = "2022-09-01";
 
 export async function mintAccessToken(tenantId, clientId, clientSecret) {
@@ -9,7 +12,7 @@ export async function mintAccessToken(tenantId, clientId, clientSecret) {
     grant_type: "client_credentials",
     client_id: clientId,
     client_secret: clientSecret,
-    scope: "https://management.azure.com/.default",
+    scope: MGMT_SCOPE,
   });
 
   var res = await fetch(`${LOGIN_URL}/${tenantId}/oauth2/v2.0/token`, {
@@ -21,6 +24,49 @@ export async function mintAccessToken(tenantId, clientId, clientSecret) {
   if (!res.ok) {
     var text = await res.text();
     throw new Error(`Azure auth failed: ${res.status} ${text}`);
+  }
+
+  var data = await res.json();
+  return data.access_token;
+}
+
+// Acquire a token via managed/workload identity.
+// Works on Container Apps, App Service, Azure Functions (IDENTITY_ENDPOINT),
+// and VMs/VMSS (IMDS at 169.254.169.254).
+export async function mintManagedIdentityToken(clientId) {
+  var identityEndpoint = process.env.IDENTITY_ENDPOINT;
+  var identityHeader = process.env.IDENTITY_HEADER;
+
+  if (identityEndpoint && identityHeader) {
+    // Container Apps / App Service / Functions
+    var url = `${identityEndpoint}?resource=${MGMT_RESOURCE}&api-version=2019-08-01`;
+    if (clientId) url += `&client_id=${clientId}`;
+
+    var res = await fetch(url, {
+      headers: { "X-IDENTITY-HEADER": identityHeader },
+    });
+
+    if (!res.ok) {
+      var text = await res.text();
+      throw new Error(`Azure managed identity auth failed: ${res.status} ${text}`);
+    }
+
+    var data = await res.json();
+    return data.access_token;
+  }
+
+  // VM / VMSS - Instance Metadata Service (IMDS)
+  var imdsUrl = "http://169.254.169.254/metadata/identity/oauth2/token" +
+    `?resource=${MGMT_RESOURCE}&api-version=2018-02-01`;
+  if (clientId) imdsUrl += `&client_id=${clientId}`;
+
+  var res = await fetch(imdsUrl, {
+    headers: { Metadata: "true" },
+  });
+
+  if (!res.ok) {
+    var text = await res.text();
+    throw new Error(`Azure IMDS auth failed: ${res.status} ${text}`);
   }
 
   var data = await res.json();
@@ -144,6 +190,7 @@ export async function verifyCredentials(
 }
 
 export async function getToken(cfg) {
+  if (cfg.identity) return mintManagedIdentityToken(cfg.clientId);
   return mintAccessToken(cfg.tenantId, cfg.clientId, cfg.clientSecret);
 }
 
