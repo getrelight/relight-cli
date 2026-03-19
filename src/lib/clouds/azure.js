@@ -163,7 +163,10 @@ export async function pollOperation(method, path, body, token, opts) {
       }
     }
     if (status === "Failed" || status === "Canceled") {
-      throw new Error(`Azure operation failed: ${JSON.stringify(pollData.error || pollData)}`);
+      var err = pollData.error;
+      var msg = err?.message || pollData.message || "Unknown error";
+      if (err?.details) msg += " " + (Array.isArray(err.details) ? err.details.map((d) => d.message || d.code).join("; ") : err.details);
+      throw new Error(`Azure operation failed: ${msg}`);
     }
   }
   throw new Error("Timed out waiting for Azure operation to complete.");

@@ -6,9 +6,141 @@ import { join } from "path";
 import { phase, status, success, hint, fatal, fmt, generateAppName } from "../lib/output.js";
 import { readLink, linkApp, resolveAppName } from "../lib/link.js";
 import { resolveStack } from "../lib/providers/resolve.js";
-import { PROVIDERS } from "../lib/config.js";
+import { PROVIDERS, tryGetProviderConfig } from "../lib/config.js";
 import { dockerBuild, dockerTag, dockerPush, dockerLogin } from "../lib/docker.js";
 import { getPortal, portalApi } from "../lib/portal.js";
+
+function resolveDeployTarget(nameOrPath, path, mode) {
+  var name;
+  var dockerPath;
+  if (!nameOrPath) {
+    name = readLink()?.app || (mode === "portal" ? null : generateAppName());
+    if (!name && mode === "portal") {
+      fatal("App name required for portal deploy.", `Usage: ${fmt.cmd("relight deploy my-app")}`);
+    }
+    dockerPath = ".";
+  } else if (nameOrPath.startsWith(".") || nameOrPath.startsWith("/") || nameOrPath.startsWith("~")) {
+    name = readLink()?.app || (mode === "portal" ? null : generateAppName());
+    if (!name && mode === "portal") {
+      fatal("App name required. Link this directory first or provide a name.");
+    }
+    dockerPath = nameOrPath;
+  } else {
+    name = nameOrPath;
+    dockerPath = path || ".";
+  }
+  return { name, dockerPath };
+}
+
+function resolveProviderNames(options) {
+  var linked = readLink();
+  return {
+    compute: options.compute || linked?.compute || null,
+    dns: options.dns || linked?.dns || null,
+    registry: options.registry || linked?.registry || null,
+  };
+}
+
+function inferProviderType(name) {
+  if (!name) return null;
+  var configured = tryGetProviderConfig(name);
+  if (configured?.type) return configured.type;
+
+  var lower = name.toLowerCase();
+  if (lower.includes("azure")) return "azure";
+  if (lower.includes("ghcr")) return "ghcr";
+  if (lower.includes("cloudflare") || lower.startsWith("cf") || lower.includes("cf-")) return "cf";
+  if (lower.includes("aws")) return "aws";
+  if (lower.includes("gcp") || lower.includes("google")) return "gcp";
+  if (lower.includes("slicervm")) return "slicervm";
+  if (lower.includes("demo")) return "demo";
+  return null;
+}
+
+function providerSupportsRegistry(type) {
+  return ["cf", "gcp", "aws", "azure"].includes(type);
+}
+
+function buildEnvConfig(options) {
+  var env = {};
+  var envKeys = [];
+  if (options.env) {
+    for (var v of options.env) {
+      var eq = v.indexOf("=");
+      if (eq !== -1) {
+        var k = v.substring(0, eq);
+        env[k] = v.substring(eq + 1);
+        envKeys.push(k);
+      }
+    }
+  }
+  return { env, envKeys };
+}
+
+function buildPortalAppConfig(name, options, computeType, hasRegistry) {
+  var { env, envKeys } = buildEnvConfig(options);
+  var defaultRegion = !hasRegistry
+    ? "self-hosted"
+    : computeType === "gcp"
+      ? "us-central1"
+      : computeType === "aws"
+        ? "us-east-1"
+        : computeType === "azure"
+          ? "eastus"
+          : "enam";
+  var regions = options.regions
+    ? options.regions.split(",").map((r) => r.trim())
+    : [defaultRegion];
+  var now = new Date().toISOString();
+
+  var appConfig = {
+    name,
+    regions,
+    instances: options.instances || (hasRegistry ? 2 : 1),
+    port: options.port || 8080,
+    sleepAfter: options.sleep || "30s",
+    instanceType: options.instanceType
+      || ((!hasRegistry || computeType === "gcp" || computeType === "aws" || computeType === "azure")
+        ? undefined
+        : "lite"),
+    vcpu: options.vcpu || undefined,
+    memory: options.memory || undefined,
+    disk: options.disk || undefined,
+    env,
+    envKeys,
+    secretKeys: [],
+    domains: [],
+    createdAt: now,
+    deployedAt: now,
+  };
+
+  if (options.observability === false) appConfig.observability = false;
+  return appConfig;
+}
+
+async function ensurePortalApp(name, options) {
+  var names = resolveProviderNames(options);
+  if (!names.compute) {
+    fatal(
+      "Portal app does not exist yet and no compute provider was specified.",
+      `Run ${fmt.cmd("relight deploy my-app . --compute <portal-compute-label>")} to create it.`
+    );
+  }
+
+  var computeType = inferProviderType(names.compute);
+  var hasRegistry = !!names.registry || providerSupportsRegistry(computeType);
+  var appConfig = buildPortalAppConfig(name, options, computeType, hasRegistry);
+
+  status(`Creating app ${name} in portal...`);
+  await portalApi("POST", "/apps", {
+    name,
+    cloudLabel: names.compute,
+    registryLabel: names.registry || null,
+    config: appConfig,
+  });
+
+  return names;
+}
 
 export async function deploy(nameOrPath, path, options) {
   // --- Portal mode: delegate to portal for credentials & deploy ---
@@ -286,7 +418,6 @@ export async function deploy(nameOrPath, path, options) {
     name,
     providerName,
     options.dns || linked?.dns,
-    linked?.db,
     linked?.dbProvider,
     registryName || linked?.registry
   );
@@ -296,20 +427,8 @@ export async function deploy(nameOrPath, path, options) {
 // CLI builds image, does `docker push` to portal (which acts as OCI registry proxy),
 // then triggers deployment. Docker handles layer caching natively.
 async function deployViaPortal(nameOrPath, path, options) {
-  var name;
-  var dockerPath;
-  if (!nameOrPath) {
-    name = readLink()?.app;
-    if (!name) fatal("App name required for portal deploy.", `Usage: ${fmt.cmd("relight deploy my-app")}`);
-    dockerPath = ".";
-  } else if (nameOrPath.startsWith(".") || nameOrPath.startsWith("/") || nameOrPath.startsWith("~")) {
-    name = readLink()?.app;
-    if (!name) fatal("App name required. Link this directory first or provide a name.");
-    dockerPath = nameOrPath;
-  } else {
-    name = nameOrPath;
-    dockerPath = path || ".";
-  }
+  var { name, dockerPath } = resolveDeployTarget(nameOrPath, path, "portal");
+  var providerNames = resolveProviderNames(options);
 
   var tag = options.tag || `${Date.now()}`;
   var localTag = `relight-${name}:${tag}`;
@@ -320,7 +439,12 @@ async function deployViaPortal(nameOrPath, path, options) {
   try {
     prep = await portalApi("POST", `/deploy/${name}/prepare`);
   } catch (err) {
-    fatal(`Portal prepare failed: ${err.message}`);
+    if (err.message.includes(`App '${name}' not found`)) {
+      providerNames = await ensurePortalApp(name, options);
+      prep = await portalApi("POST", `/deploy/${name}/prepare`);
+    } else {
+      fatal(`Portal prepare failed: ${err.message}`);
+    }
   }
 
   var portal = getPortal();
@@ -360,7 +484,7 @@ async function deployViaPortal(nameOrPath, path, options) {
   // Docker handles layer caching - only pushes layers that are missing.
   phase("Pushing image via portal");
   status("Authenticating with portal registry...");
-  dockerLogin(portalHost, "relight", portal.token);
+  dockerLogin(portalHost, "user", portal.token);
 
   status(`Pushing ${remoteTag}...`);
   dockerTag(localTag, remoteTag);
@@ -397,7 +521,13 @@ async function deployViaPortal(nameOrPath, path, options) {
     hint("Check status", `relight deploy status ${name}`);
   }
 
-  linkApp(name);
+  linkApp(
+    name,
+    providerNames.compute,
+    providerNames.dns,
+    undefined,
+    providerNames.registry
+  );
 }
 
 // --- Pre-deploy: run command inside built image with production env vars ---
