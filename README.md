@@ -23,10 +23,9 @@ Supported providers:
 | GCP | Cloud Run | Yes | Cloud SQL (PostgreSQL) | Cloud DNS |
 | AWS | App Runner | Yes | RDS (PostgreSQL) | Route 53 |
 | Azure | Container Apps | Yes | Flexible Server (PostgreSQL) | Azure DNS |
-| Cloudflare | Containers (Workers + Durable Objects) | Yes | D1 (SQLite) | Cloudflare DNS |
+| Cloudflare | Containers (Workers + Durable Objects) | Yes | - | Cloudflare DNS |
+| DigitalOcean | - | - | Managed Databases (PostgreSQL) | DO DNS |
 | SlicerVM | Self-hosted | Yes | - | - |
-| Neon | - | - | Neon Postgres | - |
-| Turso | - | - | Turso (libSQL) | - |
 
 ## Install
 
@@ -64,7 +63,7 @@ The first deploy links the current directory to the app name. After that, `relig
 
 ```
 relight providers list               List configured providers
-relight providers add [type]         Add a provider (cf, gcp, aws, azure, slicervm, neon, turso)
+relight providers add [type]         Add a provider (cf, gcp, aws, azure, do, slicervm)
 relight providers remove <name>      Remove a provider
 relight providers default <layer> <name>  Set default provider for a layer
 relight deploy [name] [path]         Deploy an app from a Dockerfile
@@ -132,7 +131,7 @@ $ relight cost               # cost breakdown
 
 ## Databases
 
-Relight manages databases alongside your apps. Each provider uses its native database service:
+Relight manages databases alongside your apps. All database providers use managed PostgreSQL:
 
 ```sh
 # Create a database
@@ -144,13 +143,13 @@ relight db shell myapp
 # Run a query
 relight db query myapp "SELECT * FROM users"
 
-# Attach to an app (injects DATABASE_URL/DB_TOKEN)
+# Attach to an app (injects DATABASE_URL)
 relight db attach myapp myapi
 ```
 
-GCP and AWS use PostgreSQL (Cloud SQL and RDS). Azure uses Flexible Server (PostgreSQL). Cloudflare uses D1 (SQLite). Neon and Turso are standalone database providers. Connection credentials are automatically injected into your app's environment - `DATABASE_URL` for PostgreSQL providers, `DB_URL` for SQLite/libSQL providers, plus `DB_TOKEN` when applicable.
+GCP uses Cloud SQL, AWS uses RDS, Azure uses Flexible Server, and DigitalOcean uses Managed Databases - all PostgreSQL. Connection credentials are automatically injected into your app's environment as `DATABASE_URL`.
 
-Cross-provider databases are supported - you can attach a Neon database to a GCP Cloud Run app by specifying `--db neon`.
+Cross-provider databases are supported - you can attach a DigitalOcean database to a Cloudflare app by specifying `--db do`.
 
 ## BYOC model
 
@@ -230,19 +229,14 @@ relight domains add myapp.example.com
 - Credentials: Cloudflare API token with Workers and Containers permissions.
 - Each app is a Worker backed by Durable Objects running your container. The CLI bundles and uploads the Worker template automatically.
 - Regions use Durable Object `locationHints` - placement is best-effort, not guaranteed.
-- Database: D1 (SQLite).
+- No database layer - use DigitalOcean, GCP, AWS, or Azure for databases with Cloudflare compute.
 
-### Neon (Database only)
+### DigitalOcean (Database + DNS only)
 
-- Standalone managed Postgres provider.
-- Credentials: Neon API key.
-- Databases are created as branches within a shared Neon project.
-
-### Turso (Database only)
-
-- Standalone managed libSQL provider.
-- Credentials: Turso API token.
-- Databases are created within a shared Turso group.
+- Database and DNS provider - no compute layer.
+- Credentials: DigitalOcean API token.
+- Database: Managed Databases (PostgreSQL). Simple, affordable option for teams that want managed Postgres without the complexity of the big three clouds.
+- DNS: DigitalOcean DNS.
 
 ### SlicerVM (Self-hosted)
 
