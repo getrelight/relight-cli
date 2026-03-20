@@ -37,7 +37,17 @@ async function ensureEnvironment(cfg, token) {
   };
 
   var res = await pollOperation("PUT", path, body, token, { apiVersion: CAPP_API });
-  return res;
+  // Wait for environment to be fully Succeeded before creating container apps
+  // (avoids ManagedEnvironmentNotProvisioned / terminal provisioning state Failed)
+  for (var i = 0; i < 60; i++) {
+    env = await azureApi("GET", path, null, token, { apiVersion: CAPP_API });
+    if (env.properties?.provisioningState === "Succeeded") return env;
+    if (env.properties?.provisioningState === "Failed") {
+      throw new Error(`Managed environment provisioning failed: ${JSON.stringify(env.properties?.statusReason || env.properties)}`);
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+  throw new Error("Timed out waiting for managed environment to become ready.");
 }
 
 async function getLiveApp(cfg, appName, token) {
@@ -209,6 +219,33 @@ function buildContainerApp(appConfig, imageTag, newSecrets, env, registryCfg, op
   };
 }
 
+async function getContainerAppFailureDetails(cfg, appName, token) {
+  var path = cappPath(cfg, appName);
+  var details = [];
+  try {
+    var app = await azureApi("GET", path, null, token, { apiVersion: CAPP_API });
+    var image = app.properties?.template?.containers?.[0]?.image;
+    if (image) details.push(`image=${image}`);
+    var revPath = `${path}/revisions`;
+    var revs = await azureApi("GET", revPath, null, token, { apiVersion: CAPP_API });
+    var list = revs.value || [];
+    if (list.length > 0) {
+      var sorted = list.slice().sort((a, b) => (b.properties?.createdTime || "").localeCompare(a.properties?.createdTime || ""));
+      for (var rev of sorted.slice(0, 3)) {
+        var rs = rev.properties?.runningState;
+        var hs = rev.properties?.healthState;
+        var revName = rev.name || rev.id?.split("/").pop();
+        if (rs || hs) details.push(`revision ${revName}: runningState=${rs || "n/a"} healthState=${hs || "n/a"}`);
+      }
+    } else {
+      details.push("no revisions yet (failure may be image pull or invalid config)");
+    }
+  } catch (e) {
+    details.push(`could not fetch details: ${e.message}`);
+  }
+  return details.length ? details.join("; ") : null;
+}
+
 async function waitForApp(cfg, appName, token) {
   var path = cappPath(cfg, appName);
   for (var i = 0; i < 120; i++) {
@@ -216,7 +253,17 @@ async function waitForApp(cfg, appName, token) {
     var state = app.properties?.provisioningState;
     if (state === "Succeeded") return app;
     if (state === "Failed" || state === "Canceled") {
-      throw new Error(`Container App reached state: ${state}`);
+      var extra = await getContainerAppFailureDetails(cfg, appName, token);
+      var msg = `Container App provisioning failed (state: ${state}).`;
+      if (extra) msg += ` ${extra}`;
+      var imageTag = app.properties?.template?.containers?.[0]?.image || "";
+      var noRevisions = !extra || extra.includes("no revisions yet");
+      if (imageTag.includes("ghcr.io") && noRevisions) {
+        msg += " Brak rewizji — Azure prawdopodobnie nie może pobrać obrazu. GHCR: 1) Sprawdź, że obraz istnieje (docker pull " + imageTag + " z PAT). 2) Token musi mieć zakres read:packages, a pakiet musi być dostępny dla tego tokenu. 3) Dokładny błąd: Portal Azure → grupa zasobów → Dziennik aktywności → nieudana operacja „Utwórz lub zaktualizuj aplikację kontenera” → szczegóły operacji.";
+      } else {
+        msg += " Możliwe przyczyny: zły tag obrazu lub dane rejestru (token GHCR), albo targetPort niezgodny z portem aplikacji. Dokładny błąd: Portal Azure → grupa zasobów → Dziennik aktywności → nieudana operacja → szczegóły.";
+      }
+      throw new Error(msg);
     }
     await new Promise((r) => setTimeout(r, 5000));
   }

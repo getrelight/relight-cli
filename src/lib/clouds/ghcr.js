@@ -6,7 +6,7 @@ function buildBasicAuth(username, token) {
   return Buffer.from(`${username}:${token}`).toString("base64");
 }
 
-function parseAuthHeader(header) {
+export function parseAuthHeader(header) {
   if (!header) return null;
 
   var match = header.match(/^Bearer\s+(.*)$/i);
@@ -21,6 +21,31 @@ function parseAuthHeader(header) {
     attrs[key] = value;
   }
   return attrs.realm ? attrs : null;
+}
+
+/** Get a Bearer token for pulling from the given repository (e.g. "owner/repo"). */
+export async function getPullToken(username, token, repository) {
+  var res = await fetch(`${GHCR_REGISTRY}/v2/`, {
+    headers: { Authorization: `Basic ${buildBasicAuth(username, token)}` },
+  });
+  var challenge = parseAuthHeader(res.headers.get("www-authenticate"));
+  if (!challenge) {
+    if (res.ok) return null;
+    var text = await res.text();
+    throw new Error(`GHCR auth failed: ${res.status} ${text}`.trim());
+  }
+  var url = new URL(challenge.realm);
+  url.searchParams.set("service", challenge.service || "ghcr.io");
+  url.searchParams.set("scope", `repository:${repository}:pull`);
+  var tokenRes = await fetch(url.toString(), {
+    headers: { Authorization: `Basic ${buildBasicAuth(username, token)}` },
+  });
+  if (!tokenRes.ok) {
+    var t = await tokenRes.text();
+    throw new Error(`GHCR token failed: ${tokenRes.status} ${t}`.trim());
+  }
+  var data = await tokenRes.json();
+  return data.token || data.access_token || null;
 }
 
 export async function verifyCredentials(username, token, scopePrefix) {
