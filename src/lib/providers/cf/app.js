@@ -108,6 +108,15 @@ export function buildWorkerMetadata(appConfig, { firstDeploy = false, newSecrets
     }
   }
 
+  // System-level secrets injected by portal (not in appConfig.secretKeys)
+  if (newSecrets) {
+    for (var sysKey of ["GATEWAY_SECRET"]) {
+      if (newSecrets[sysKey] !== undefined && !secretKeys.includes(sysKey)) {
+        bindings.push({ type: "secret_text", name: sysKey, text: newSecrets[sysKey] });
+      }
+    }
+  }
+
   var metadata = {
     main_module: "index.js",
     compatibility_date: "2025-10-08",
@@ -164,7 +173,6 @@ export async function deploy(cfg, appName, imageTag, opts) {
   var isFirstDeploy = opts.isFirstDeploy;
   var newSecrets = opts.newSecrets || {};
 
-  // Upload worker
   var currentHash = templateHash();
   var needsWorkerUpload = isFirstDeploy || appConfig.templateHash !== currentHash;
 
@@ -172,7 +180,16 @@ export async function deploy(cfg, appName, imageTag, opts) {
     var bundledCode = getWorkerBundle();
     appConfig.templateHash = currentHash;
     var metadata = buildWorkerMetadata(appConfig, { firstDeploy: isFirstDeploy, newSecrets });
-    await uploadWorker(cfg.accountId, cfg.apiToken, scriptName, bundledCode, metadata);
+    try {
+      await uploadWorker(cfg.accountId, cfg.apiToken, scriptName, bundledCode, metadata);
+    } catch (err) {
+      if (isFirstDeploy && err.message && err.message.includes("10079")) {
+        metadata = buildWorkerMetadata(appConfig, { firstDeploy: false, newSecrets });
+        await uploadWorker(cfg.accountId, cfg.apiToken, scriptName, bundledCode, metadata);
+      } else {
+        throw err;
+      }
+    }
   } else {
     await pushAppConfig(cfg, appName, appConfig, { newSecrets });
   }
@@ -212,7 +229,6 @@ export async function deploy(cfg, appName, imageTag, opts) {
     });
   }
 
-  // Enable workers.dev route
   try {
     await enableWorkerSubdomain(cfg.accountId, cfg.apiToken, scriptName);
   } catch {}
@@ -245,7 +261,7 @@ export async function getAppInfo(cfg, appName) {
 
 // --- Destroy ---
 
-export async function destroyApp(cfg, appName) {
+export async function destroyApp(cfg, appName, opts) {
   var scriptName = `relight-${appName}`;
 
   // Delete D1 database if attached
@@ -266,7 +282,6 @@ export async function destroyApp(cfg, appName) {
     }
   } catch {}
 
-  // Delete worker
   await deleteWorker(cfg.accountId, cfg.apiToken, scriptName);
 }
 

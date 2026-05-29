@@ -12,6 +12,7 @@ export var TOKEN_URL =
       { key: "containers", type: "edit" },
       { key: "zone", type: "read" },
       { key: "dns", type: "edit" },
+      { key: "workers_routes", type: "edit" },
     ])
   ) +
   "&name=relight-cli";
@@ -126,10 +127,48 @@ export async function uploadWorker(accountId, apiToken, scriptName, code, metada
   return res.json();
 }
 
+export async function uploadWorkerToDispatchNamespace(accountId, apiToken, namespace, scriptName, code, metadata) {
+  var form = new FormData();
+  form.append(
+    "metadata",
+    new Blob([JSON.stringify(metadata)], { type: "application/json" })
+  );
+  form.append(
+    "index.js",
+    new Blob([code], { type: "application/javascript+module" }),
+    "index.js"
+  );
+
+  var res = await fetch(
+    `${CF_API}/accounts/${accountId}/workers/dispatch/namespaces/${namespace}/scripts/${scriptName}`,
+    {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${apiToken}` },
+      body: form,
+    }
+  );
+
+  if (!res.ok) {
+    var text = await res.text();
+    throw new Error(`Dispatch namespace worker upload failed: ${res.status} ${text}`);
+  }
+
+  return res.json();
+}
+
 export async function deleteWorker(accountId, apiToken, scriptName) {
   return cfApi(
     "DELETE",
     `/accounts/${accountId}/workers/scripts/${scriptName}`,
+    null,
+    apiToken
+  );
+}
+
+export async function deleteWorkerFromDispatchNamespace(accountId, apiToken, namespace, scriptName) {
+  return cfApi(
+    "DELETE",
+    `/accounts/${accountId}/workers/dispatch/namespaces/${namespace}/scripts/${scriptName}`,
     null,
     apiToken
   );
@@ -334,6 +373,37 @@ export async function updateDnsRecord(accountId, apiToken, zoneId, recordId, rec
     "PUT",
     `/zones/${zoneId}/dns_records/${recordId}`,
     record,
+    apiToken
+  );
+}
+
+// --- Zone-level Worker Routes ---
+
+export async function listWorkerRoutes(accountId, apiToken, zoneId) {
+  var res = await cfApi(
+    "GET",
+    `/zones/${zoneId}/workers/routes`,
+    null,
+    apiToken
+  );
+  return res.result || [];
+}
+
+export async function createWorkerRoute(accountId, apiToken, zoneId, pattern, scriptName) {
+  var res = await cfApi(
+    "POST",
+    `/zones/${zoneId}/workers/routes`,
+    { pattern, script: scriptName },
+    apiToken
+  );
+  return res.result;
+}
+
+export async function deleteWorkerRoute(accountId, apiToken, zoneId, routeId) {
+  return cfApi(
+    "DELETE",
+    `/zones/${zoneId}/workers/routes/${routeId}`,
+    null,
     apiToken
   );
 }

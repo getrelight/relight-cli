@@ -85,6 +85,11 @@ program
   .option("--db <name>", "Database provider (for --backup-db)")
   .option("--pre-deploy <cmd>", "Run command in container before push (e.g. migrations)")
   .option("--backup-db", "Backup database before deploying")
+  .option("--gateway", "Deploy behind gateway (protected by shared secret)")
+  .option("--hostname <domain>", "Gateway: hostname (e.g. app.example.com, *.internal.example.com)")
+  .option("--groups <groups>", "Gateway: required access groups (comma-separated)")
+  .option("--match-mode <mode>", "Gateway: group match mode (any|all)", "any")
+  .option("--path-prefix <prefix>", "Gateway: path prefix (default: /)", "/")
   .option("--json", "Output result as JSON")
   .option("-y, --yes", "Skip confirmation prompt")
   .action(deploy);

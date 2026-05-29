@@ -31,6 +31,15 @@ export default {
   async fetch(request, env) {
     var appConfig = JSON.parse(env.RELIGHT_APP_CONFIG);
 
+    // Gateway secret: when set, reject requests without the correct header.
+    // This makes the worker unreachable directly even though it has a workers.dev URL.
+    if (env.GATEWAY_SECRET) {
+      var gatewayHeader = request.headers.get("x-gateway-secret");
+      if (gatewayHeader !== env.GATEWAY_SECRET) {
+        return new Response("Forbidden", { status: 403 });
+      }
+    }
+
     // Hrana protocol handler - only active when D1 binding exists
     if (env.DB) {
       var url = new URL(request.url);
