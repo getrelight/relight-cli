@@ -2,6 +2,18 @@ import { phase, status, success, fatal, hint, fmt, table } from "../lib/output.j
 import { resolveAppName, readLink, linkApp } from "../lib/link.js";
 import { resolveStack } from "../lib/providers/resolve.js";
 import { createInterface } from "readline";
+
+async function portalDb(method, path, body) {
+  var { getPortal, portalApi } = await import("../lib/portal.js");
+  if (!getPortal()) return null;
+  return portalApi(method, path, body);
+}
+
+async function isPortalMode(options) {
+  if (options.db) return false;
+  var { getPortal } = await import("../lib/portal.js");
+  return !!getPortal();
+}
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, statSync, existsSync, appendFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -54,6 +66,26 @@ function resolveDatabase(name, options) {
 export async function dbCreate(name, options) {
   if (!name) fatal("Database name is required.", `Usage: relight db create <name> --db <provider>`);
 
+  // Portal mode
+  if (await isPortalMode(options)) {
+    phase("Creating database");
+    status(`${name}...`);
+    var data;
+    try {
+      data = await portalDb("POST", "/dbs", { name, db_label: options.dbLabel || null });
+    } catch (e) {
+      fatal(e.message);
+    }
+    success(`Database ${fmt.app(name)} created!`);
+    console.log(`  ${fmt.bold("Provider:")}  ${data.label} (${data.provider})`);
+    if (data.dbName) console.log(`  ${fmt.bold("DB Name:")}   ${data.dbName}`);
+    if (data.connectionUrl) console.log(`  ${fmt.bold("DB URL:")}    ${fmt.url(data.connectionUrl)}`);
+    if (data.connectionUrl?.startsWith("postgres")) {
+      hint("Store connection URL as a secret", `relight secrets push DATABASE_URL="${data.connectionUrl}" --app <app-name>`);
+    }
+    return;
+  }
+
   var stack = await resolveStack(options, ["db"]);
   var { cfg, provider, name: providerName } = stack.db;
 
@@ -98,7 +130,19 @@ export async function dbCreate(name, options) {
     console.log(`  ${fmt.bold("DB URL:")}    ${fmt.url(result.connectionUrl)}`);
   }
   console.log(`  ${fmt.bold("Token:")}     ${result.dbToken}`);
-  hint("Next", `relight db attach ${name} <app>`);
+
+  if (provider.IS_POSTGRES && result.connectionUrl) {
+    // Import getPortal lazily — avoid errors when portal is not configured
+    var { getPortal } = await import("../lib/portal.js");
+    if (getPortal()) {
+      var masked = result.connectionUrl.replace(/:([^:@]+)@/, ":***@");
+      hint("Store connection URL as a secret", `relight secrets push ${name} DATABASE_URL="${masked}"`);
+    } else {
+      hint("Next", `relight db attach ${name} <app>`);
+    }
+  } else {
+    hint("Next", `relight db attach ${name} <app>`);
+  }
 }
 
 export async function dbDestroy(name, options) {
@@ -124,6 +168,18 @@ export async function dbDestroy(name, options) {
 
   phase("Destroying database");
 
+  // Portal mode
+  if (await isPortalMode(options)) {
+    var qs = options.dbLabel ? `?db=${options.dbLabel}` : "";
+    try {
+      await portalDb("DELETE", `/dbs/${name}${qs}`);
+    } catch (e) {
+      fatal(e.message);
+    }
+    success(`Database ${fmt.app(name)} destroyed.`);
+    return;
+  }
+
   var stack = await resolveStack(options, ["db"]);
   var { cfg, provider } = stack.db;
 
@@ -137,6 +193,22 @@ export async function dbDestroy(name, options) {
 }
 
 export async function dbList(options) {
+  // Portal mode
+  if (await isPortalMode(options)) {
+    var qs = options.dbLabel ? `?db=${options.dbLabel}` : "";
+    var data = await portalDb("GET", `/dbs${qs}`);
+    var databases = data.dbs || [];
+    if (options.json) { console.log(JSON.stringify(databases, null, 2)); return; }
+    if (databases.length === 0) {
+      console.log(fmt.dim("\n  No databases. Create one with: relight db create <name>\n"));
+      return;
+    }
+    var rows = databases.map((db) => [db.name, db.dbName || "-"]);
+    console.log(fmt.dim(`  Provider: ${data.label} (${data.provider})\n`));
+    console.log(table(["NAME", "DB NAME"], rows));
+    return;
+  }
+
   var stack = await resolveStack(options, ["db"]);
   var { cfg, provider } = stack.db;
 
@@ -309,6 +381,25 @@ export async function dbDetach(appName, options) {
 
 export async function dbInfo(name, options) {
   name = resolveDatabase(name, options);
+
+  // Portal mode
+  if (await isPortalMode(options)) {
+    var qs = options.dbLabel ? `?db=${options.dbLabel}` : "";
+    var info;
+    try {
+      info = await portalDb("GET", `/dbs/${name}${qs}`);
+    } catch (e) {
+      fatal(e.message);
+    }
+    if (options.json) { console.log(JSON.stringify(info, null, 2)); return; }
+    console.log("");
+    console.log(`${fmt.bold("Database:")}   ${fmt.app(name)}`);
+    console.log(`${fmt.bold("Provider:")}   ${info.label} (${info.provider})`);
+    if (info.dbName) console.log(`${fmt.bold("DB Name:")}    ${info.dbName}`);
+    if (info.connectionUrl) console.log(`${fmt.bold("DB URL:")}     ${fmt.url(info.connectionUrl)}`);
+    console.log("");
+    return;
+  }
 
   var stack = await resolveStack(options, ["db"]);
   var { cfg, provider, name: providerName } = stack.db;

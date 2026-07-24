@@ -4,7 +4,7 @@ import { Command } from "commander";
 import { providersList, providersAdd, providersRemove, providersDefaultCmd } from "./commands/providers.js";
 import { doctor } from "./commands/doctor.js";
 import { deploy } from "./commands/deploy.js";
-import { appsList, appsInfo, appsDestroy } from "./commands/apps.js";
+import { appsList, appsInfo, appsCreate, appsDestroy } from "./commands/apps.js";
 import {
   configShow,
   configSet,
@@ -64,34 +64,34 @@ providersCmd
 
 program
   .command("deploy [name] [path]")
-  .description("Deploy an app from a Dockerfile (name auto-generated if omitted)")
-  .option("--compute <name>", "Provider for compute")
-  .option("--registry <name>", "Provider for container registry")
-  .option("-t, --tag <tag>", "Image tag (default: deploy-<timestamp>)")
-  .option("-e, --env <vars...>", "Set env vars (KEY=VALUE)")
-  .option(
-    "--regions <hints>",
-    "Comma-separated location hints (wnam,enam,sam,weur,eeur,apac,oc,afr,me)"
-  )
-  .option("-i, --instances <n>", "Instances per region", parseInt)
-  .option("--port <port>", "Container port", parseInt)
-  .option("--sleep <duration>", "Sleep after idle (e.g. 5m, 30s, never)", "30s")
-  .option("--instance-type <type>", "Instance type (lite, base, standard, large)")
-  .option("--vcpu <n>", "vCPU allocation (e.g. 0.0625, 0.5, 1, 2)", parseFloat)
-  .option("--memory <mb>", "Memory in MiB (e.g. 256, 512, 1024)", parseInt)
-  .option("--disk <mb>", "Disk in MB (e.g. 2000, 5000)", parseInt)
-  .option("--dns <name>", "Provider for DNS records")
-  .option("--no-observability", "Disable Workers observability/logs")
-  .option("--db <name>", "Database provider (for --backup-db)")
-  .option("--pre-deploy <cmd>", "Run command in container before push (e.g. migrations)")
-  .option("--backup-db", "Backup database before deploying")
-  .option("--gateway", "Deploy behind gateway (protected by shared secret)")
-  .option("--hostname <domain>", "Gateway: hostname (e.g. app.example.com, *.internal.example.com)")
-  .option("--groups <groups>", "Gateway: required access groups (comma-separated)")
-  .option("--match-mode <mode>", "Gateway: group match mode (any|all)", "any")
-  .option("--path-prefix <prefix>", "Gateway: path prefix (default: /)", "/")
+  .description("Build and deploy an app (portal: app must exist — create with apps create)")
+  .option("-t, --tag <tag>", "Image tag (default: timestamp)")
+  .option("--dockerfile <path>", "Path to Dockerfile (relative to build context)")
+  .option("--build-secret <secrets...>", "Docker BuildKit secrets passed to docker build (e.g. id=github_token,env=MY_TOKEN)")
   .option("--json", "Output result as JSON")
   .option("-y, --yes", "Skip confirmation prompt")
+  // BYOC-only options (ignored in portal mode):
+  .option("--compute <name>", "BYOC: compute provider")
+  .option("--registry <name>", "BYOC: container registry provider")
+  .option("-e, --env <vars...>", "BYOC: set env vars (KEY=VALUE)")
+  .option("--regions <hints>", "BYOC: location hints (wnam,enam,sam,weur,eeur,apac,oc,afr,me)")
+  .option("-i, --instances <n>", "BYOC: instances per region", parseInt)
+  .option("--port <port>", "BYOC: container port", parseInt)
+  .option("--sleep <duration>", "BYOC: sleep after idle (e.g. 5m, 30s, never)")
+  .option("--instance-type <type>", "BYOC: instance type (lite, basic, standard, standard-2..4, dev)")
+  .option("--vcpu <n>", "BYOC: vCPU allocation", parseFloat)
+  .option("--memory <mb>", "BYOC: memory in MiB", parseInt)
+  .option("--disk <mb>", "BYOC: disk in MB", parseInt)
+  .option("--dns <name>", "BYOC: DNS provider")
+  .option("--no-observability", "BYOC: disable Workers observability/logs")
+  .option("--db <name>", "BYOC: database provider (for --backup-db)")
+  .option("--pre-deploy <cmd>", "BYOC: run command in container before push")
+  .option("--backup-db", "BYOC: backup database before deploying")
+  .option("--gateway", "BYOC: deploy behind gateway")
+  .option("--hostname <domain>", "BYOC: gateway hostname")
+  .option("--groups <groups>", "BYOC: gateway access groups (comma-separated)")
+  .option("--match-mode <mode>", "BYOC: gateway group match mode (any|all)", "any")
+  .option("--path-prefix <prefix>", "BYOC: gateway path prefix", "/")
   .action(deploy);
 
 // --- Apps (topic root = list) ---
@@ -104,6 +104,32 @@ apps
   .option("--compute <name>", "Provider for compute")
   .option("--json", "Output as JSON")
   .action(appsList);
+
+apps
+  .command("create <name>")
+  .description("Register a new app with its configuration (portal mode)")
+  .option("--compute <label>", "Cloud provider label (required)")
+  .option("--registry <label>", "Container registry label")
+  .option("--regions <hints>", "Location hints, comma-separated (e.g. euw,wnam)")
+  .option("-i, --instances <n>", "Instances per region (default: 2)", parseInt)
+  .option("--port <port>", "Container port (default: 8080)", parseInt)
+  .option("--sleep <duration>", "Idle sleep timeout (e.g. 5m, 30s, never; default: 30s)")
+  .option("--instance-type <type>", "Instance type (lite, basic, standard, standard-2..4, dev)")
+  .option("--vcpu <n>", "vCPU allocation (e.g. 0.0625, 0.5, 1, 2)", parseFloat)
+  .option("--memory <mb>", "Memory in MiB (e.g. 256, 512, 1024)", parseInt)
+  .option("--disk <mb>", "Disk in MB (e.g. 2000, 5000)", parseInt)
+  .option("-e, --env <vars...>", "Initial env vars (KEY=VALUE)")
+  .option("--no-observability", "Disable Workers observability/logs")
+  .option("--gateway", "Place app behind gateway (protected by shared secret)")
+  .option("--hostname <domain>", "Gateway: public hostname (e.g. app.example.com)")
+  .option("--groups <groups>", "Gateway: required access groups (comma-separated)")
+  .option("--match-mode <mode>", "Gateway: group match mode (any|all)", "any")
+  .option("--path-prefix <prefix>", "Gateway: path prefix (default: /)", "/")
+  .option("--sm-connection <label>", "Secret manager: connection label (e.g. infisical)")
+  .option("--sm-project-id <id>", "Secret manager: project / workspace ID")
+  .option("--sm-environment <env>", "Secret manager: environment (default: production)")
+  .option("--sm-path <path>", "Secret manager: secret path (default: /)")
+  .action(appsCreate);
 
 apps
   .command("info [name]")
@@ -171,10 +197,11 @@ program
     "Comma-separated location hints (wnam,enam,sam,weur,eeur,apac,oc,afr,me)"
   )
   .option("-i, --instances <n>", "Instances per region", parseInt)
-  .option("--instance-type <type>", "Instance type (lite, base, standard, large)")
+  .option("--instance-type <type>", "Instance type (lite, basic, standard, standard-2..4, dev)")
   .option("--vcpu <n>", "vCPU allocation (e.g. 0.0625, 0.5, 1, 2)", parseFloat)
   .option("--memory <mb>", "Memory in MiB (e.g. 256, 512, 1024)", parseInt)
   .option("--disk <mb>", "Disk in MB (e.g. 2000, 5000)", parseInt)
+  .option("--sleep <duration>", "Sleep after idle (e.g. 10m, 30s, 1h)")
   .option("--json", "Output as JSON")
   .action(scale);
 
@@ -384,7 +411,7 @@ program
 
 // --- Portals ---
 
-import { portalsAdd, portalsList, portalsRemove } from "./commands/portals.js";
+import { portalsAdd, portalsList, portalsRemove, portalsDefaults } from "./commands/portals.js";
 
 var portalsCmd = program.command("portals").description("Manage portal connections");
 
@@ -403,12 +430,88 @@ portalsCmd
   .description("Disconnect from portal")
   .action(portalsRemove);
 
+var portalsDefaultsCmd = portalsCmd
+  .command("defaults")
+  .description("Show or set portal-level defaults");
+
+portalsDefaultsCmd
+  .command("show", { isDefault: true })
+  .description("Show current portal defaults")
+  .action(() => portalsDefaults([]));
+
+portalsDefaultsCmd
+  .command("set <args...>")
+  .description("Set portal defaults (KEY=VALUE ...)")
+  .action((args) => portalsDefaults(["set", ...args]));
+
 // --- Doctor ---
 
 program
   .command("doctor")
   .description("Check system setup and provider connectivity")
   .action(doctor);
+
+// --- Secrets ---
+
+import {
+  secretsList,
+  secretsPush,
+  secretsDelete,
+  secretsConfigure,
+  secretsSync,
+} from "./commands/secrets.js";
+
+var secretsCmd = program
+  .command("secrets")
+  .description("Manage per-app secrets in configured secret manager");
+
+secretsCmd
+  .command("list [app]", { isDefault: true })
+  .description("List secret keys for an app (values hidden)")
+  .action(secretsList);
+
+secretsCmd
+  .command("push [args...]")
+  .description("Push secrets to app (KEY=VALUE ...)")
+  .action((args) => secretsPush(args, {}));
+
+secretsCmd
+  .command("sync [app]")
+  .description("Fetch secrets from SM and sync to CF Worker bindings")
+  .action(secretsSync);
+
+secretsCmd
+  .command("delete <args...>")
+  .description("Delete a secret from app ([app] KEY)")
+  .action((args) => secretsDelete(args, {}));
+
+secretsCmd
+  .command("configure [app]")
+  .description("Configure secret manager for an app (interactive)")
+  .action(secretsConfigure);
+
+// --- SSH Keys ---
+
+import { sshKeysList, sshKeysAdd, sshKeysRemove } from "./commands/ssh-keys.js";
+
+var sshKeysCmd = program
+  .command("ssh-keys")
+  .description("Manage SSH authorized keys for container access");
+
+sshKeysCmd
+  .command("list [app]", { isDefault: true })
+  .description("List SSH keys configured for an app")
+  .action(sshKeysList);
+
+sshKeysCmd
+  .command("add [args...]")
+  .description("Add SSH key ([app] <name> <public-key>)")
+  .action((args) => sshKeysAdd(args, {}));
+
+sshKeysCmd
+  .command("remove [args...]")
+  .description("Remove SSH key by name ([app] <key-name>)")
+  .action((args) => sshKeysRemove(args, {}));
 
 // --- Top-level aliases ---
 

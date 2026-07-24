@@ -43,3 +43,12 @@ export async function portalApi(method, path, body) {
 
   return data;
 }
+
+export async function getPortalAppByName(name) {
+  var data = await portalApi("GET", "/apps");
+  var apps = data.apps ?? data;
+  var app = apps.find((a) => a.name === name);
+  if (!app) return null;
+  var detail = await portalApi("GET", `/apps/${app.id}`);
+  return detail.app;
+}

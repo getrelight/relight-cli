@@ -12,9 +12,11 @@ function ensureDocker() {
 export function dockerBuild(contextPath, tag, opts = {}) {
   ensureDocker();
   var platform = opts.platform || "linux/amd64";
+  var fileFlag = opts.dockerfile ? `-f ${opts.dockerfile}` : "";
+  var secretFlags = (opts.secrets || []).map((s) => `--secret ${s}`).join(" ");
   execSync(
-    `docker build --platform ${platform} --provenance=false -t ${tag} ${contextPath}`,
-    { stdio: "pipe" }
+    `docker build --platform ${platform} --provenance=false ${fileFlag} ${secretFlags} -t ${tag} ${contextPath}`.replace(/\s+/g, " ").trim(),
+    { stdio: "inherit", env: { ...process.env, DOCKER_BUILDKIT: "1" } }
   );
 }
 

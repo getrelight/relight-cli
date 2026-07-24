@@ -10,6 +10,7 @@ export var TOKEN_URL =
     JSON.stringify([
       { key: "workers_scripts", type: "edit" },
       { key: "containers", type: "edit" },
+      { key: "hyperdrive", type: "edit" },
       { key: "zone", type: "read" },
       { key: "dns", type: "edit" },
       { key: "workers_routes", type: "edit" },
@@ -558,4 +559,31 @@ export async function importD1(accountId, apiToken, dbId, body) {
     body,
     apiToken
   );
+}
+
+// --- Hyperdrive ---
+
+export async function listHyperdriveConfigs(accountId, apiToken) {
+  var res = await cfApi("GET", `/accounts/${accountId}/hyperdrive/configs`, null, apiToken);
+  return res.result || [];
+}
+
+export async function createHyperdriveConfig(accountId, apiToken, name, origin) {
+  var res = await cfApi(
+    "POST",
+    `/accounts/${accountId}/hyperdrive/configs`,
+    { name, origin },
+    apiToken
+  );
+  return res.result;
+}
+
+export async function updateHyperdriveConfig(accountId, apiToken, id, name, origin) {
+  var res = await cfApi(
+    "PUT",
+    `/accounts/${accountId}/hyperdrive/configs/${id}`,
+    { name, origin },
+    apiToken
+  );
+  return res.result;
 }

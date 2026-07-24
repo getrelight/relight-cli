@@ -75,3 +75,50 @@ export async function portalsRemove() {
   removePortal();
   success("Portal disconnected.");
 }
+
+export async function portalsDefaults(args) {
+  if (!args || args.length === 0) {
+    var data = await portalApi("GET", "/settings/defaults");
+    process.stderr.write(`${fmt.bold("Portal defaults:")}\n`);
+    process.stderr.write(`  ${fmt.bold("compute:")}           ${data.compute || fmt.dim("(none)")}\n`);
+    process.stderr.write(`  ${fmt.bold("db:")}                ${data.db || fmt.dim("(none)")}\n`);
+    process.stderr.write(`  ${fmt.bold("registry:")}          ${data.registry || fmt.dim("(none)")}\n`);
+    process.stderr.write(`  ${fmt.bold("gateway_enabled:")}   ${data.gateway_enabled}\n`);
+    process.stderr.write(`  ${fmt.bold("sm_connection:")}     ${data.sm_connection_label || fmt.dim("(none)")}\n`);
+    return;
+  }
+
+  // relight portals defaults set KEY=VAL ...
+  if (args[0] === "set") {
+    var pairs = args.slice(1);
+    if (pairs.length === 0) {
+      fatal("Usage: relight portals defaults set KEY=VALUE ...");
+    }
+
+    var update = {};
+    var VALID = { compute: 1, db: 1, registry: 1, gateway_enabled: 1, sm_connection_label: 1, gateway: 1 };
+    for (var pair of pairs) {
+      var eq = pair.indexOf("=");
+      if (eq === -1) fatal(`Invalid format: ${pair}. Expected KEY=VALUE.`);
+      var k = pair.substring(0, eq);
+      var v = pair.substring(eq + 1);
+      if (k === "gateway") k = "gateway_enabled";
+      if (!VALID[k]) fatal(`Unknown key: ${k}. Valid keys: compute, db, registry, gateway_enabled, sm_connection_label`);
+      if (k === "gateway_enabled") {
+        update[k] = v === "true" || v === "1" || v === "yes";
+      } else {
+        update[k] = v || null;
+      }
+    }
+
+    var result = await portalApi("PATCH", "/settings/defaults", update);
+    success("Portal defaults updated.");
+    process.stderr.write(`  ${fmt.bold("compute:")}           ${result.compute || fmt.dim("(none)")}\n`);
+    process.stderr.write(`  ${fmt.bold("db:")}                ${result.db || fmt.dim("(none)")}\n`);
+    process.stderr.write(`  ${fmt.bold("registry:")}          ${result.registry || fmt.dim("(none)")}\n`);
+    process.stderr.write(`  ${fmt.bold("gateway_enabled:")}   ${result.gateway_enabled}\n`);
+    process.stderr.write(`  ${fmt.bold("sm_connection:")}     ${result.sm_connection_label || fmt.dim("(none)")}\n`);
+  } else {
+    fatal("Usage: relight portals defaults [set KEY=VALUE ...]");
+  }
+}

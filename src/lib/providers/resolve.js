@@ -12,12 +12,32 @@ export var LAYERS = ["app", "dns", "db", "registry"];
 
 var FLAG_MAP = { app: "compute", dns: "dns", db: "db", registry: "registry" };
 
+// Cache portal defaults per process to avoid repeated API calls
+var _portalDefaults = undefined;
+
+async function tryGetPortalDefaults() {
+  if (_portalDefaults !== undefined) return _portalDefaults;
+  try {
+    var { portalApi, getPortal } = await import("../portal.js");
+    if (!getPortal()) {
+      _portalDefaults = null;
+      return null;
+    }
+    var data = await portalApi("GET", "/settings/defaults");
+    _portalDefaults = data;
+    return _portalDefaults;
+  } catch {
+    _portalDefaults = null;
+    return null;
+  }
+}
+
 export async function resolveStack(options, requiredLayers) {
   if (!requiredLayers) requiredLayers = ["app"];
   var stack = {};
 
   for (var layer of requiredLayers) {
-    var name = resolveProviderName(options, layer);
+    var name = await resolveProviderName(options, layer);
     var instance = getProviderConfig(name);
     var type = instance.type;
 
@@ -40,7 +60,7 @@ export async function resolveStack(options, requiredLayers) {
   return stack;
 }
 
-function resolveProviderName(options, layer) {
+async function resolveProviderName(options, layer) {
   var flag = FLAG_MAP[layer];
 
   // 1. Explicit flag (--compute, --dns, --db, --registry)
@@ -64,6 +84,11 @@ function resolveProviderName(options, layer) {
     defaultName = getDefault("app");
     if (defaultName) return defaultName;
   }
+
+  // 3.5. Portal defaults (if portal configured and no local default)
+  var portalDefaults = await tryGetPortalDefaults();
+  var layerKey = { app: "compute", db: "db", registry: "registry", dns: "dns" }[layer];
+  if (portalDefaults?.[layerKey]) return portalDefaults[layerKey];
 
   // 4. Auto-resolve: only one provider supports this layer
   var candidates = getConfiguredProviders().filter((p) =>
