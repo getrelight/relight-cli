@@ -4,11 +4,38 @@ import { execSync } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 import { phase, status, success, hint, fatal, fmt, generateAppName } from "../lib/output.js";
-import { readLink, linkApp, resolveAppName } from "../lib/link.js";
+import { readLink, linkApp, updateLink, resolveAppName } from "../lib/link.js";
 import { resolveStack } from "../lib/providers/resolve.js";
-import { PROVIDERS, tryGetProviderConfig } from "../lib/config.js";
+import { PROVIDERS } from "../lib/config.js";
 import { dockerBuild, dockerTag, dockerPush, dockerLogin } from "../lib/docker.js";
 import { getPortal, portalApi } from "../lib/portal.js";
+
+function buildGatewayMeta(options, linked, prepGatewayConfig) {
+  // Priority: --gateway flag > .relight.yaml > portal prepare response
+  var isGateway = options.gateway || linked?.gateway;
+
+  if (!isGateway && prepGatewayConfig?.enabled) {
+    // Use portal's stored gateway config (no --gateway flag needed on redeploy)
+    return {
+      hostname: prepGatewayConfig.hostname,
+      path_prefix: prepGatewayConfig.path_prefix || "/",
+      groups: prepGatewayConfig.groups || [],
+      match_mode: prepGatewayConfig.match_mode || "any",
+    };
+  }
+
+  if (!isGateway) return null;
+  var hostname = options.hostname || linked?.gateway?.hostname || null;
+  var groups = options.groups
+    ? options.groups.split(",").map((g) => g.trim()).filter(Boolean)
+    : linked?.gateway?.groups || [];
+  return {
+    hostname,
+    path_prefix: options.pathPrefix || linked?.gateway?.path_prefix || "/",
+    groups,
+    match_mode: options.matchMode || linked?.gateway?.match_mode || "any",
+  };
+}
 
 function resolveDeployTarget(nameOrPath, path, mode) {
   var name;
@@ -32,35 +59,6 @@ function resolveDeployTarget(nameOrPath, path, mode) {
   return { name, dockerPath };
 }
 
-function resolveProviderNames(options) {
-  var linked = readLink();
-  return {
-    compute: options.compute || linked?.compute || null,
-    dns: options.dns || linked?.dns || null,
-    registry: options.registry || linked?.registry || null,
-  };
-}
-
-function inferProviderType(name) {
-  if (!name) return null;
-  var configured = tryGetProviderConfig(name);
-  if (configured?.type) return configured.type;
-
-  var lower = name.toLowerCase();
-  if (lower.includes("azure")) return "azure";
-  if (lower.includes("ghcr")) return "ghcr";
-  if (lower.includes("cloudflare") || lower.startsWith("cf") || lower.includes("cf-")) return "cf";
-  if (lower.includes("aws")) return "aws";
-  if (lower.includes("gcp") || lower.includes("google")) return "gcp";
-  if (lower.includes("slicervm")) return "slicervm";
-  if (lower.includes("demo")) return "demo";
-  return null;
-}
-
-function providerSupportsRegistry(type) {
-  return ["cf", "gcp", "aws", "azure"].includes(type);
-}
-
 function buildEnvConfig(options) {
   var env = {};
   var envKeys = [];
@@ -75,71 +73,6 @@ function buildEnvConfig(options) {
     }
   }
   return { env, envKeys };
-}
-
-function buildPortalAppConfig(name, options, computeType, hasRegistry) {
-  var { env, envKeys } = buildEnvConfig(options);
-  var defaultRegion = !hasRegistry
-    ? "self-hosted"
-    : computeType === "gcp"
-      ? "us-central1"
-      : computeType === "aws"
-        ? "us-east-1"
-        : computeType === "azure"
-          ? "eastus"
-          : "enam";
-  var regions = options.regions
-    ? options.regions.split(",").map((r) => r.trim())
-    : [defaultRegion];
-  var now = new Date().toISOString();
-
-  var appConfig = {
-    name,
-    regions,
-    instances: options.instances || (hasRegistry ? 2 : 1),
-    port: options.port || 8080,
-    sleepAfter: options.sleep || "30s",
-    instanceType: options.instanceType
-      || ((!hasRegistry || computeType === "gcp" || computeType === "aws" || computeType === "azure")
-        ? undefined
-        : "lite"),
-    vcpu: options.vcpu || undefined,
-    memory: options.memory || undefined,
-    disk: options.disk || undefined,
-    env,
-    envKeys,
-    secretKeys: [],
-    domains: [],
-    createdAt: now,
-    deployedAt: now,
-  };
-
-  if (options.observability === false) appConfig.observability = false;
-  return appConfig;
-}
-
-async function ensurePortalApp(name, options) {
-  var names = resolveProviderNames(options);
-  if (!names.compute) {
-    fatal(
-      "Portal app does not exist yet and no compute provider was specified.",
-      `Run ${fmt.cmd("relight deploy my-app . --compute <portal-compute-label>")} to create it.`
-    );
-  }
-
-  var computeType = inferProviderType(names.compute);
-  var hasRegistry = !!names.registry || providerSupportsRegistry(computeType);
-  var appConfig = buildPortalAppConfig(name, options, computeType, hasRegistry);
-
-  status(`Creating app ${name} in portal...`);
-  await portalApi("POST", "/apps", {
-    name,
-    cloudLabel: names.compute,
-    registryLabel: names.registry || null,
-    config: appConfig,
-  });
-
-  return names;
 }
 
 export async function deploy(nameOrPath, path, options) {
@@ -343,7 +276,7 @@ export async function deploy(nameOrPath, path, options) {
   }
   phase("Building image");
   status(`${localTag} for ${platform}`);
-  dockerBuild(dockerPath, localTag, { platform });
+  dockerBuild(dockerPath, localTag, { platform, dockerfile: options.dockerfile, secrets: options.buildSecret, buildArgs: options.buildArg });
 
   // --- Pre-deploy hook ---
   var linked = readLink();
@@ -358,16 +291,23 @@ export async function deploy(nameOrPath, path, options) {
     await runPreDeploy(preDeployCmd, localTag, appConfig, linked);
   }
 
-  if (!hasRegistry) {
-    // No registry: deploy extracts and uploads the image directly
-    phase("Deploying");
-    await appProvider.deploy(cfg, name, localTag, {
-      appConfig,
-      isFirstDeploy,
-      newSecrets,
-    });
-  } else {
-    // 2. Push to registry
+  var byocGateway = buildGatewayMeta(options, readLink());
+
+  // 2. Push image to registry
+  var deployImageTag;
+  if (providerType === "cf") {
+    // CF Containers only pulls from CF Registry / Docker Hub / ECR.
+    // Push directly to CF Registry regardless of --registry flag.
+    var { CF_REGISTRY, getRegistryCredentials } = await import("../lib/clouds/cf.js");
+    var cfTag = `${CF_REGISTRY}/${cfg.accountId}/relight-${name}:${Date.now()}`;
+    phase("Pushing to CF Registry");
+    var cfCreds = await getRegistryCredentials(cfg.accountId, cfg.apiToken);
+    dockerLogin(CF_REGISTRY, cfCreds.username, cfCreds.password);
+    dockerTag(localTag, cfTag);
+    status(`Pushing ${cfTag}...`);
+    dockerPush(cfTag);
+    deployImageTag = cfTag;
+  } else if (hasRegistry) {
     phase("Pushing to registry");
     status("Authenticating...");
     registryCreds = await registry.getCredentials(registryCfg);
@@ -376,26 +316,32 @@ export async function deploy(nameOrPath, path, options) {
     status(`Pushing ${remoteTag}...`);
     dockerTag(localTag, remoteTag);
     dockerPush(remoteTag);
-
-    // 3. Deploy via provider
-    phase("Deploying");
-    await appProvider.deploy(cfg, name, remoteTag, {
-      appConfig,
-      isFirstDeploy,
-      newSecrets,
-      registryName,
-      registryCredentials: registryCreds,
-    });
+    deployImageTag = remoteTag;
+  } else {
+    deployImageTag = localTag;
   }
+
+  // 3. Deploy
+  phase("Deploying");
+  appConfig.image = deployImageTag;
+  await appProvider.deploy(cfg, name, deployImageTag, {
+    appConfig,
+    isFirstDeploy,
+    newSecrets,
+    registryName,
+    registryCredentials: registryCreds,
+  });
 
   // 4. Resolve URL and report
   var url = await appProvider.getAppUrl(cfg, name);
+  var gatewayUrl = byocGateway ? `https://${byocGateway.hostname}${byocGateway.path_prefix}` : null;
 
   if (options.json) {
     var result = {
       name,
       image: hasRegistry ? remoteTag : localTag,
-      url,
+      url: gatewayUrl || url,
+      gateway: !!byocGateway,
       regions: appConfig.regions,
       instances: appConfig.instances,
       firstDeploy: isFirstDeploy,
@@ -406,10 +352,16 @@ export async function deploy(nameOrPath, path, options) {
     success(`App ${fmt.app(name)} deployed!`);
     process.stderr.write(`  ${fmt.bold("Name:")}  ${fmt.app(name)}\n`);
     process.stderr.write(`  ${fmt.bold("Image:")} ${hasRegistry ? remoteTag : localTag}\n`);
-    process.stderr.write(
-      `  ${fmt.bold("URL:")}   ${url ? fmt.url(url) : fmt.dim("(configure workers.dev subdomain to see URL)")}\n`
-    );
-    hint("Next", `relight open ${name}`);
+    if (byocGateway) {
+      process.stderr.write(`  ${fmt.bold("Access:")} ${fmt.dim("private (via gateway + secret)")}\n`);
+      process.stderr.write(`  ${fmt.bold("Gateway:")} ${gatewayUrl ? fmt.url(gatewayUrl) : fmt.dim("(configure gateway domain)")}\n`);
+      process.stderr.write(`  ${fmt.bold("Direct:")} ${url ? fmt.dim(url + " (blocked by secret)") : fmt.dim("n/a")}\n`);
+    } else {
+      process.stderr.write(
+        `  ${fmt.bold("URL:")}   ${url ? fmt.url(url) : fmt.dim("(configure workers.dev subdomain to see URL)")}\n`
+      );
+    }
+    hint("Next", byocDispatchNamespace ? `curl ${gatewayUrl}` : `relight open ${name}`);
   }
 
   // Link this directory to the app
@@ -424,27 +376,27 @@ export async function deploy(nameOrPath, path, options) {
 }
 
 // --- Portal mode deploy ---
-// CLI builds image, does `docker push` to portal (which acts as OCI registry proxy),
-// then triggers deployment. Docker handles layer caching natively.
+// CLI builds image, pushes to registry, then tells portal to deploy.
+// App must already exist — create it first with: relight apps create <name>
 async function deployViaPortal(nameOrPath, path, options) {
   var { name, dockerPath } = resolveDeployTarget(nameOrPath, path, "portal");
-  var providerNames = resolveProviderNames(options);
 
   var tag = options.tag || `${Date.now()}`;
   var localTag = `relight-${name}:${tag}`;
 
-  // 1. Get app config from portal (no credentials returned)
+  // 1. Fetch app config + credentials from portal
   phase("Preparing deploy via portal");
   var prep;
   try {
     prep = await portalApi("POST", `/deploy/${name}/prepare`);
   } catch (err) {
     if (err.message.includes(`App '${name}' not found`)) {
-      providerNames = await ensurePortalApp(name, options);
-      prep = await portalApi("POST", `/deploy/${name}/prepare`);
-    } else {
-      fatal(`Portal prepare failed: ${err.message}`);
+      fatal(
+        `App '${name}' not found in portal.`,
+        `Create it first: ${fmt.cmd(`relight apps create ${name} --compute <label>`)}`
+      );
     }
+    fatal(`Portal prepare failed: ${err.message}`);
   }
 
   var portal = getPortal();
@@ -452,14 +404,20 @@ async function deployViaPortal(nameOrPath, path, options) {
   var remoteTag = `${portalHost}/${name}:${tag}`;
 
   // 2. Show summary
-  process.stderr.write(`\n${fmt.bold("Deploy summary (portal mode)")}\n`);
+  process.stderr.write(`\n${fmt.bold("Deploy summary")}\n`);
   process.stderr.write(`${fmt.dim("-".repeat(40))}\n`);
-  process.stderr.write(`  ${fmt.bold("App:")}        ${fmt.app(name)}${prep.isFirstDeploy ? fmt.dim(" (new)") : ""}\n`);
-  process.stderr.write(`  ${fmt.bold("Provider:")}   ${fmt.cloud(prep.provider)}\n`);
-  process.stderr.write(`  ${fmt.bold("Path:")}       ${dockerPath}\n`);
-  process.stderr.write(`  ${fmt.bold("Image:")}      ${remoteTag}\n`);
+  process.stderr.write(`  ${fmt.bold("App:")}      ${fmt.app(name)}\n`);
+  process.stderr.write(`  ${fmt.bold("Provider:")} ${fmt.cloud(prep.provider)}\n`);
+  process.stderr.write(`  ${fmt.bold("Path:")}     ${dockerPath}\n`);
+  process.stderr.write(`  ${fmt.bold("Image:")}    ${remoteTag}\n`);
   if (prep.appConfig?.regions) {
-    process.stderr.write(`  ${fmt.bold("Regions:")}    ${prep.appConfig.regions.join(", ")}\n`);
+    process.stderr.write(`  ${fmt.bold("Regions:")}  ${prep.appConfig.regions.join(", ")}\n`);
+  }
+  if (prep.appConfig?.sleepAfter) {
+    process.stderr.write(`  ${fmt.bold("Sleep:")}    ${prep.appConfig.sleepAfter}\n`);
+  }
+  if (prep.gatewayConfig?.enabled) {
+    process.stderr.write(`  ${fmt.bold("Gateway:")}  ${prep.gatewayConfig.hostname || fmt.dim("(no hostname)")}\n`);
   }
   process.stderr.write(`${fmt.dim("-".repeat(40))}\n`);
 
@@ -478,30 +436,38 @@ async function deployViaPortal(nameOrPath, path, options) {
   // 3. Build Docker image locally
   phase("Building image");
   status(`${localTag} for linux/amd64`);
-  dockerBuild(dockerPath, localTag, { platform: "linux/amd64" });
+  dockerBuild(dockerPath, localTag, { platform: "linux/amd64", dockerfile: options.dockerfile, secrets: options.buildSecret, buildArgs: options.buildArg });
 
-  // 4. Docker login to portal + push (portal proxies to real registry)
-  // Docker handles layer caching - only pushes layers that are missing.
-  phase("Pushing image via portal");
-  status("Authenticating with portal registry...");
-  dockerLogin(portalHost, "user", portal.token);
+  var linked = readLink();
+  var preDeployCmd = options.preDeploy || linked?.preDeploy;
+  if (preDeployCmd) {
+    await runPreDeploy(preDeployCmd, localTag, prep.appConfig || {}, linked);
+  }
 
-  status(`Pushing ${remoteTag}...`);
-  dockerTag(localTag, remoteTag);
-  dockerPush(remoteTag);
-
-  // 5. Get the real image tag from portal (mapped to destination registry)
-  // The manifest push returns the real imageTag via the prepare endpoint
+  // 4. Push image to registry
   var imageTag;
-  try {
-    var tagInfo = await portalApi("POST", `/deploy/${name}/prepare`);
-    // Use the tag we pushed - portal knows the mapping
-    imageTag = remoteTag;
-  } catch {
+  if (prep.cfRegistry) {
+    // CF compute: push directly to CF Registry
+    phase("Pushing to CF Registry");
+    var cfr = prep.cfRegistry;
+    var cfTag = cfr.imageTag.replace(/:latest$/, `:${tag}`);
+    dockerLogin(cfr.registry, cfr.username, cfr.password);
+    dockerTag(localTag, cfTag);
+    status(`Pushing ${cfTag}...`);
+    dockerPush(cfTag);
+    imageTag = cfTag;
+  } else {
+    // Non-CF compute: push via portal OCI proxy
+    phase("Pushing image via portal");
+    status("Authenticating with portal registry...");
+    dockerLogin(portalHost, "user", portal.token);
+    status(`Pushing ${remoteTag}...`);
+    dockerTag(localTag, remoteTag);
+    dockerPush(remoteTag);
     imageTag = remoteTag;
   }
 
-  // 6. Tell portal to deploy
+  // 5. Trigger deployment
   phase("Deploying via portal");
   var result;
   try {
@@ -510,7 +476,7 @@ async function deployViaPortal(nameOrPath, path, options) {
     fatal(`Portal deploy failed: ${err.message}`);
   }
 
-  // 7. Report
+  // 6. Report
   if (options.json) {
     console.log(JSON.stringify({ name, imageTag, deploymentId: result.deployment?.id, status: result.deployment?.status }, null, 2));
   } else {
@@ -521,13 +487,8 @@ async function deployViaPortal(nameOrPath, path, options) {
     hint("Check status", `relight deploy status ${name}`);
   }
 
-  linkApp(
-    name,
-    providerNames.compute,
-    providerNames.dns,
-    undefined,
-    providerNames.registry
-  );
+  linkApp(name, null, null, undefined, null);
+  if (options.preDeploy) updateLink({ preDeploy: options.preDeploy });
 }
 
 // --- Pre-deploy: run command inside built image with production env vars ---

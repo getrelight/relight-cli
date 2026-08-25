@@ -6,8 +6,19 @@ export class AppContainer extends Container {
   constructor(ctx, env) {
     super(ctx, env);
     var appConfig = JSON.parse(env.RELIGHT_APP_CONFIG);
-    this.defaultPort = appConfig.port || 8080;
+    var port = appConfig.port || 8080;
+
+    // Set port properties together — requiredPorts must match defaultPort so that
+    // the startup health-check pings the correct port.
+    this.defaultPort = port;
+    this.requiredPorts = [port];
+
     this.sleepAfter = appConfig.sleepAfter || "30s";
+    // The base Container constructor calls renewActivityTimeout() synchronously
+    // (inside blockConcurrencyWhile) before this constructor body runs, so
+    // sleepAfterMs was calculated with the DEFAULT value. Re-call here so the
+    // idle timer reflects the app's actual sleepAfter from the very first alarm.
+    this.renewActivityTimeout();
 
     // Read env vars from native bindings (new format)
     var envVars = {};
@@ -23,13 +34,97 @@ export class AppContainer extends Container {
         if (envVars[key] === undefined) envVars[key] = appConfig.env[key];
       }
     }
+    // NOTE: Hyperdrive connection strings (*.hyperdrive.local) are only resolvable
+    // inside the Workers runtime — containers run as Firecracker VMs with no access
+    // to that DNS. The container must receive the original DATABASE_URL so it can
+    // connect directly to PostgreSQL. Hyperdrive is not used for container workloads.
     this.envVars = envVars;
+  }
+
+  // Extended startup options: CF Firecracker cold start can take up to 30s
+  // depending on image size and region provisioning — the base class default
+  // (8s instance get + 20s port ready) is not enough in those cases.
+  get _startOpts() {
+    return {
+      cancellationOptions: {
+        instanceGetTimeoutMS: 30_000,
+        portReadyTimeoutMS: 120_000,
+        waitInterval: 300,
+      },
+    };
+  }
+
+  async fetch(request) {
+    // Clone upfront so we can retry with the original body if needed.
+    var cloned = request.clone();
+
+    var state = await this.getState();
+    if (!this.container.running || state.status !== "healthy") {
+      var err = await this._wake();
+      if (err) return err;
+    }
+
+    var response = await this.containerFetch(request, this.defaultPort);
+
+    // Race condition: sleepAfter timer fired between the state check above and
+    // the actual proxy call. Retry once after waking the container.
+    if (response.status === 500 && !this.container.running) {
+      console.log("[AppContainer] container slept mid-request, retrying");
+      await new Promise(resolve => setTimeout(resolve, 500));
+      var err2 = await this._wake();
+      if (err2) return err2;
+      return this.containerFetch(cloned, this.defaultPort);
+    }
+
+    return response;
+  }
+
+  async _wake() {
+    try {
+      await this.startAndWaitForPorts(this._startOpts);
+      return null;
+    } catch (e) {
+      var msg = e instanceof Error ? e.message : String(e);
+      console.error("[AppContainer] wake failed:", msg);
+      if (msg.includes("no container instance") || msg.includes("Maximum number")) {
+        return new Response("Container is starting up — please retry in a moment.", {
+          status: 503,
+          headers: { "Retry-After": "10" },
+        });
+      }
+      return new Response("Failed to start container: " + msg, { status: 500 });
+    }
+  }
+
+  onStart() {
+    console.log("[AppContainer] started port=" + this.defaultPort + " sleep=" + this.sleepAfter);
+  }
+
+  onStop(payload) {
+    var reason = payload?.reason || "unknown";
+    var exitCode = payload?.exitCode != null ? " exit=" + payload.exitCode : "";
+    console.log("[AppContainer] stopped reason=" + reason + exitCode);
+  }
+
+  onError(error) {
+    console.error("[AppContainer] error:", error instanceof Error ? error.message : String(error));
+    // Returning normally (not throwing) lets the base class mark the container
+    // as stopped. CF restarts it transparently on the next request via fetch().
   }
 }
 
 export default {
   async fetch(request, env) {
     var appConfig = JSON.parse(env.RELIGHT_APP_CONFIG);
+
+    // Gateway secret: when set, reject requests without the correct header.
+    // This makes the worker unreachable directly even though it has a workers.dev URL.
+    if (env.GATEWAY_SECRET) {
+      var gatewayHeader = request.headers.get("x-gateway-secret");
+      if (gatewayHeader !== env.GATEWAY_SECRET) {
+        return new Response("Forbidden", { status: 403 });
+      }
+    }
 
     // Hrana protocol handler - only active when D1 binding exists
     if (env.DB) {

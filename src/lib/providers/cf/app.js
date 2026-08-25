@@ -108,6 +108,15 @@ export function buildWorkerMetadata(appConfig, { firstDeploy = false, newSecrets
     }
   }
 
+  // System-level secrets injected by portal (not in appConfig.secretKeys)
+  if (newSecrets) {
+    for (var sysKey of ["GATEWAY_SECRET"]) {
+      if (newSecrets[sysKey] !== undefined && !secretKeys.includes(sysKey)) {
+        bindings.push({ type: "secret_text", name: sysKey, text: newSecrets[sysKey] });
+      }
+    }
+  }
+
   var metadata = {
     main_module: "index.js",
     compatibility_date: "2025-10-08",
@@ -139,6 +148,31 @@ export function buildWorkerMetadata(appConfig, { firstDeploy = false, newSecrets
 
 // --- Container config builder ---
 
+// During a rolling deploy CF starts new instances before stopping old ones.
+// Using step_percentage = floor(100/instances), CF replaces at most 1 instance
+// per region per step → peak = desired + regions (minimum headroom).
+function calcMaxInstances(appConfig) {
+  var regions = appConfig.regions?.length || 1;
+  var desired = regions * (appConfig.instances || 2);
+  return desired + regions;
+}
+
+function calcRolloutStepPercentage(appConfig) {
+  var instances = appConfig.instances || 2;
+  return Math.min(100, Math.floor(100 / instances));
+}
+
+// Map human-friendly / legacy instance type aliases to CF API enum values.
+// CF API accepts: lite | basic | standard-1 | standard-2 | standard-3 | standard-4 | standard | dev
+var INSTANCE_TYPE_ALIASES = {
+  base: "basic",
+  large: "standard-4",
+};
+function normalizeInstanceType(t) {
+  if (!t) return undefined;
+  return INSTANCE_TYPE_ALIASES[t] ?? t;
+}
+
 function buildContainerConfig(appConfig) {
   var cfg = {
     image: appConfig.image,
@@ -150,7 +184,7 @@ function buildContainerConfig(appConfig) {
     if (appConfig.memory) cfg.memory_mib = appConfig.memory;
     if (appConfig.disk) cfg.disk = { size_mb: appConfig.disk };
   } else {
-    cfg.instance_type = appConfig.instanceType || "lite";
+    cfg.instance_type = normalizeInstanceType(appConfig.instanceType) || "lite";
   }
 
   return cfg;
@@ -164,7 +198,6 @@ export async function deploy(cfg, appName, imageTag, opts) {
   var isFirstDeploy = opts.isFirstDeploy;
   var newSecrets = opts.newSecrets || {};
 
-  // Upload worker
   var currentHash = templateHash();
   var needsWorkerUpload = isFirstDeploy || appConfig.templateHash !== currentHash;
 
@@ -172,7 +205,16 @@ export async function deploy(cfg, appName, imageTag, opts) {
     var bundledCode = getWorkerBundle();
     appConfig.templateHash = currentHash;
     var metadata = buildWorkerMetadata(appConfig, { firstDeploy: isFirstDeploy, newSecrets });
-    await uploadWorker(cfg.accountId, cfg.apiToken, scriptName, bundledCode, metadata);
+    try {
+      await uploadWorker(cfg.accountId, cfg.apiToken, scriptName, bundledCode, metadata);
+    } catch (err) {
+      if (isFirstDeploy && err.message && err.message.includes("10079")) {
+        metadata = buildWorkerMetadata(appConfig, { firstDeploy: false, newSecrets });
+        await uploadWorker(cfg.accountId, cfg.apiToken, scriptName, bundledCode, metadata);
+      } else {
+        throw err;
+      }
+    }
   } else {
     await pushAppConfig(cfg, appName, appConfig, { newSecrets });
   }
@@ -184,7 +226,7 @@ export async function deploy(cfg, appName, imageTag, opts) {
   }
 
   var existingApp = await findContainerApp(cfg.accountId, cfg.apiToken, scriptName);
-  var maxInstances = (appConfig.regions?.length || 1) * (appConfig.instances || 2);
+  var maxInstances = calcMaxInstances(appConfig);
 
   if (existingApp) {
     if (existingApp.max_instances !== maxInstances) {
@@ -196,7 +238,7 @@ export async function deploy(cfg, appName, imageTag, opts) {
       description: `Deploy ${imageTag}`,
       strategy: "rolling",
       kind: "full_auto",
-      step_percentage: 100,
+      step_percentage: calcRolloutStepPercentage(appConfig),
       target_configuration: buildContainerConfig(appConfig),
     });
   } else {
@@ -212,7 +254,6 @@ export async function deploy(cfg, appName, imageTag, opts) {
     });
   }
 
-  // Enable workers.dev route
   try {
     await enableWorkerSubdomain(cfg.accountId, cfg.apiToken, scriptName);
   } catch {}
@@ -245,7 +286,7 @@ export async function getAppInfo(cfg, appName) {
 
 // --- Destroy ---
 
-export async function destroyApp(cfg, appName) {
+export async function destroyApp(cfg, appName, opts) {
   var scriptName = `relight-${appName}`;
 
   // Delete D1 database if attached
@@ -266,7 +307,6 @@ export async function destroyApp(cfg, appName) {
     }
   } catch {}
 
-  // Delete worker
   await deleteWorker(cfg.accountId, cfg.apiToken, scriptName);
 }
 
@@ -280,8 +320,7 @@ export async function scale(cfg, appName, opts) {
   var scriptName = `relight-${appName}`;
   var containerApp = await findContainerApp(cfg.accountId, cfg.apiToken, scriptName);
   if (containerApp) {
-    var maxInstances = (appConfig.regions?.length || 1) * (appConfig.instances || 2);
-    var modification = { max_instances: maxInstances };
+    var modification = { max_instances: calcMaxInstances(appConfig) };
 
     if (appConfig.vcpu || appConfig.memory || appConfig.disk) {
       modification.configuration = {};
@@ -289,7 +328,7 @@ export async function scale(cfg, appName, opts) {
       if (appConfig.memory) modification.configuration.memory_mib = appConfig.memory;
       if (appConfig.disk) modification.configuration.disk = { size_mb: appConfig.disk };
     } else if (appConfig.instanceType) {
-      modification.configuration = { instance_type: appConfig.instanceType };
+      modification.configuration = { instance_type: normalizeInstanceType(appConfig.instanceType) };
     }
 
     await modifyContainerApp(cfg.accountId, cfg.apiToken, containerApp.id, modification);

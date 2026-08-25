@@ -30,6 +30,7 @@ import { verifyConnection } from "../lib/clouds/slicervm.js";
 import { verifyApiKey } from "../lib/clouds/neon.js";
 import { verifyApiToken as verifyTursoToken } from "../lib/clouds/turso.js";
 import { verifyCredentials as verifyGHCR } from "../lib/clouds/ghcr.js";
+import { verifyToken as verifyDO } from "../lib/clouds/do.js";
 import kleur from "kleur";
 
 function prompt(rl, question) {
@@ -56,6 +57,8 @@ function normalizeType(input) {
     slicer: "slicervm",
     neon: "neon",
     turso: "turso",
+    do: "do",
+    digitalocean: "do",
   };
   return aliases[input.toLowerCase()] || input.toLowerCase();
 }
@@ -156,6 +159,9 @@ export async function providersAdd(typeName) {
       break;
     case "turso":
       providerConfig = await authTurso(rl);
+      break;
+    case "do":
+      providerConfig = await authDO(rl);
       break;
   }
 
@@ -763,4 +769,42 @@ async function authTurso(rl) {
   process.stderr.write(`  Authenticated with ${fmt.bold(orgSlug)}.\n`);
 
   return { apiToken, orgSlug };
+}
+
+async function authDO(rl) {
+  process.stderr.write(`\n  ${kleur.bold("DigitalOcean API token")}\n\n`);
+  process.stderr.write(
+    `  ${fmt.dim("Get your API token at https://cloud.digitalocean.com/account/api/tokens")}\n\n`
+  );
+
+  var apiToken = await prompt(rl, "API token: ");
+  apiToken = (apiToken || "").trim();
+  if (!apiToken) {
+    rl.close();
+    fatal("No API token provided.");
+  }
+
+  process.stderr.write("\nVerifying...\n");
+  try {
+    await verifyDO(apiToken);
+  } catch (e) {
+    rl.close();
+    fatal("Authentication failed.", e.message);
+  }
+
+  process.stderr.write(`\n  ${kleur.bold("Database cluster UUID")}\n\n`);
+  process.stderr.write(
+    `  ${fmt.dim("Find it at https://cloud.digitalocean.com/databases → select cluster → Settings tab")}\n\n`
+  );
+
+  var clusterId = await prompt(rl, "Cluster UUID: ");
+  clusterId = (clusterId || "").trim();
+  if (!clusterId) {
+    rl.close();
+    fatal("No cluster UUID provided.");
+  }
+
+  process.stderr.write(`  Authenticated. Cluster: ${fmt.bold(clusterId)}\n`);
+
+  return { apiToken, clusterId };
 }
