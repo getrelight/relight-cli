@@ -14,8 +14,9 @@ export function dockerBuild(contextPath, tag, opts = {}) {
   var platform = opts.platform || "linux/amd64";
   var fileFlag = opts.dockerfile ? `-f ${opts.dockerfile}` : "";
   var secretFlags = (opts.secrets || []).map((s) => `--secret ${s}`).join(" ");
+  var argFlags = (opts.buildArgs || []).map((a) => `--build-arg ${a}`).join(" ");
   execSync(
-    `docker build --platform ${platform} --provenance=false ${fileFlag} ${secretFlags} -t ${tag} ${contextPath}`.replace(/\s+/g, " ").trim(),
+    `docker build --platform ${platform} --provenance=false ${fileFlag} ${secretFlags} ${argFlags} -t ${tag} ${contextPath}`.replace(/\s+/g, " ").trim(),
     { stdio: "inherit", env: { ...process.env, DOCKER_BUILDKIT: "1" } }
   );
 }

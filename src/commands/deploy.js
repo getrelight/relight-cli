@@ -4,7 +4,7 @@ import { execSync } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 import { phase, status, success, hint, fatal, fmt, generateAppName } from "../lib/output.js";
-import { readLink, linkApp, resolveAppName } from "../lib/link.js";
+import { readLink, linkApp, updateLink, resolveAppName } from "../lib/link.js";
 import { resolveStack } from "../lib/providers/resolve.js";
 import { PROVIDERS } from "../lib/config.js";
 import { dockerBuild, dockerTag, dockerPush, dockerLogin } from "../lib/docker.js";
@@ -276,7 +276,7 @@ export async function deploy(nameOrPath, path, options) {
   }
   phase("Building image");
   status(`${localTag} for ${platform}`);
-  dockerBuild(dockerPath, localTag, { platform, dockerfile: options.dockerfile, secrets: options.buildSecret });
+  dockerBuild(dockerPath, localTag, { platform, dockerfile: options.dockerfile, secrets: options.buildSecret, buildArgs: options.buildArg });
 
   // --- Pre-deploy hook ---
   var linked = readLink();
@@ -436,7 +436,13 @@ async function deployViaPortal(nameOrPath, path, options) {
   // 3. Build Docker image locally
   phase("Building image");
   status(`${localTag} for linux/amd64`);
-  dockerBuild(dockerPath, localTag, { platform: "linux/amd64", dockerfile: options.dockerfile, secrets: options.buildSecret });
+  dockerBuild(dockerPath, localTag, { platform: "linux/amd64", dockerfile: options.dockerfile, secrets: options.buildSecret, buildArgs: options.buildArg });
+
+  var linked = readLink();
+  var preDeployCmd = options.preDeploy || linked?.preDeploy;
+  if (preDeployCmd) {
+    await runPreDeploy(preDeployCmd, localTag, prep.appConfig || {}, linked);
+  }
 
   // 4. Push image to registry
   var imageTag;
@@ -482,6 +488,7 @@ async function deployViaPortal(nameOrPath, path, options) {
   }
 
   linkApp(name, null, null, undefined, null);
+  if (options.preDeploy) updateLink({ preDeploy: options.preDeploy });
 }
 
 // --- Pre-deploy: run command inside built image with production env vars ---

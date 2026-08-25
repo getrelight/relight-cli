@@ -68,6 +68,7 @@ program
   .option("-t, --tag <tag>", "Image tag (default: timestamp)")
   .option("--dockerfile <path>", "Path to Dockerfile (relative to build context)")
   .option("--build-secret <secrets...>", "Docker BuildKit secrets passed to docker build (e.g. id=github_token,env=MY_TOKEN)")
+  .option("--build-arg <args...>", "Docker build args (KEY=VALUE)")
   .option("--json", "Output result as JSON")
   .option("-y, --yes", "Skip confirmation prompt")
   // BYOC-only options (ignored in portal mode):
@@ -85,7 +86,7 @@ program
   .option("--dns <name>", "BYOC: DNS provider")
   .option("--no-observability", "BYOC: disable Workers observability/logs")
   .option("--db <name>", "BYOC: database provider (for --backup-db)")
-  .option("--pre-deploy <cmd>", "BYOC: run command in container before push")
+  .option("--pre-deploy <cmd>", "Run command in the built image before push")
   .option("--backup-db", "BYOC: backup database before deploying")
   .option("--gateway", "BYOC: deploy behind gateway")
   .option("--hostname <domain>", "BYOC: gateway hostname")
